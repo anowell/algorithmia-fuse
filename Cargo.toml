@@ -1,0 +1,14 @@
+[package]
+name = "algorithmia-fuse"
+version = "0.1.0"
+authors = ["Anthony Nowell <anthony@algorithmia.com>"]
+
+[[bin]]
+name = "mount-algofs"
+
+[dependencies]
+algorithmia = { git = "https://github.com/anowell/algorithmia-rust.git" }
+fuse = "0.2.7"
+time = "0.1.35"
+libc = "0.2.12"
+
