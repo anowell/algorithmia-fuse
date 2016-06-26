@@ -13,7 +13,10 @@ use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, Reply
 use std::collections::HashMap;
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
 
-const CREATE_TIME: Timespec = Timespec { sec: 1381237736, nsec: 0 };    // 2013-10-08 08:56
+const CREATE_TIME: Timespec = Timespec {
+    sec: 1381237736,
+    nsec: 0,
+};    // 2013-10-08 08:56
 
 
 pub struct AlgoFs {
@@ -98,7 +101,9 @@ impl AlgoFs {
         }
 
         match self.children.get(&ino) {
-            Some(children) => Ok(children.iter().map(|c_ino| self.inodes[(c_ino-1) as usize].clone() ).collect()),
+            Some(children) => Ok(children.iter()
+                .map(|c_ino| self.inodes[(c_ino - 1) as usize].clone())
+                .collect()),
             None => Err(format!("Cache miss - should not have called `cache_listdir`")),
         }
     }
@@ -110,29 +115,39 @@ impl AlgoFs {
             return Ok(vec![]);
         }
 
-        let local_path = try!(self.paths.get((ino-1) as usize)
-                .ok_or(format!("path not found for inode {}", ino))
-            ).clone();
+        let local_path = try!(self.paths
+                .get((ino - 1) as usize)
+                .ok_or(format!("path not found for inode {}", ino)))
+            .clone();
         let path = path_to_uri(&local_path);
-        println!("Fetching algo dir listing for inode: {} (+{}): {} => {}", ino, offset, local_path, path);
+        println!("Fetching algo dir listing for inode: {} (+{}): {} => {}",
+                 ino,
+                 offset,
+                 local_path,
+                 path);
 
         let my_dir = self.client.dir(&path);
-        let inos = my_dir.list().map(|entry_result|
-            match entry_result {
-                Ok(DirEntry::Dir(d)) => self.insert_dir(&uri_to_path(&d.to_data_uri()), CREATE_TIME),
-                Ok(DirEntry::File(f)) => self.insert_file(&uri_to_path(&f.to_data_uri()), Timespec::new(f.last_modified.timestamp(),0), f.size),
-                Err(err) => {
-                    // TODO: should return Err(...)?
-                    println!("Error listing directory: {}", err);
-                    0
-                },
-            }
-        ).filter(|ino| *ino != 0).collect::<Vec<_>>();
+        let inos = my_dir.list()
+            .map(|entry_result| {
+                match entry_result {
+                    Ok(DirEntry::Dir(d)) => self.insert_dir(&uri_to_path(&d.to_data_uri()), CREATE_TIME),
+                    Ok(DirEntry::File(f)) => self.insert_file(&uri_to_path(&f.to_data_uri()),
+                                                              Timespec::new(f.last_modified.timestamp(), 0),
+                                                              f.size),
+                    Err(err) => {
+                        // TODO: should return Err(...)?
+                        println!("Error listing directory: {}", err);
+                        0
+                    }
+                }
+            })
+            .filter(|ino| *ino != 0)
+            .collect::<Vec<_>>();
 
         // Update children cache so we don't hammer the API
         self.children.insert(ino, inos);
         println!("added to children: {:?}", self.children);
-        Ok(self.children[&(ino)].iter().map(|ino| self.inodes[(ino-1) as usize].clone() ).collect())
+        Ok(self.children[&(ino)].iter().map(|ino| self.inodes[(ino - 1) as usize].clone()).collect())
     }
 
     fn insert_dir(&mut self, path: &str, mtime: Timespec) -> u64 {
@@ -162,7 +177,7 @@ impl AlgoFs {
         self.inodes.push(FileAttr {
             ino: ino,
             size: size,
-            blocks: (size/512) + 1, // TODO: const BLOCKSIZE
+            blocks: (size / 512) + 1, // TODO: const BLOCKSIZE
             atime: mtime,
             mtime: mtime,
             ctime: mtime,
@@ -179,11 +194,10 @@ impl AlgoFs {
         self.paths.push(path.to_string());
         ino
     }
-
 }
 
 impl Filesystem for AlgoFs {
-    fn lookup (&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEntry) {
+    fn lookup(&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEntry) {
         println!("lookup: {} -> {}", parent, name.to_str().unwrap());
         match (parent, name.to_str()) {
             (1, Some("")) => reply.entry(&TTL, &self.inodes[0], 0),
@@ -192,9 +206,11 @@ impl Filesystem for AlgoFs {
             (_, Some(name)) => {
                 match self.children.get(&parent) {
                     Some(children) => {
-                        let ref parent_path = self.paths[(parent-1) as usize];
-                        match children.iter().find(|child_ino| self.paths[(*child_ino-1) as usize] == format!("{}/{}", parent_path, name) ) {
-                            Some(child_ino) => reply.entry(&TTL, &self.inodes[(child_ino-1) as usize], 0),
+                        let ref parent_path = self.paths[(parent - 1) as usize];
+                        match children.iter().find(|child_ino| {
+                            self.paths[(*child_ino - 1) as usize] == format!("{}/{}", parent_path, name)
+                        }) {
+                            Some(child_ino) => reply.entry(&TTL, &self.inodes[(child_ino - 1) as usize], 0),
                             None => {
                                 println!("lookup missing from cache: {} -> {}", parent, name);
                                 reply.error(ENOENT);
@@ -215,8 +231,8 @@ impl Filesystem for AlgoFs {
         };
     }
 
-    fn getattr (&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        match self.inodes.get((ino-1) as usize) {
+    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        match self.inodes.get((ino - 1) as usize) {
             Some(attr) => reply.attr(&TTL, attr),
             None => {
                 println!("getattr ENOENT: {}", ino);
@@ -225,7 +241,7 @@ impl Filesystem for AlgoFs {
         };
     }
 
-    fn read (&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, _size: u32, reply: ReplyData) {
+    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, _size: u32, reply: ReplyData) {
         println!("read {}", ino);
         if ino == 2 {
             reply.data(&"hello world".as_bytes()[offset as usize..]);
@@ -234,14 +250,14 @@ impl Filesystem for AlgoFs {
         }
     }
 
-    fn readdir (&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, mut reply: ReplyDirectory) {
+    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, mut reply: ReplyDirectory) {
         match (ino, offset) {
             (1, 0) => {
                 reply.add(1, 0, FileType::Directory, ".");
                 reply.add(1, 1, FileType::Directory, "..");
                 reply.add(2, 2, FileType::Directory, "data");
                 reply.ok();
-            },
+            }
             (1, _) => reply.ok(),
             _ => match self.inodes.len() >= (ino as usize) {
                 true => {
@@ -259,8 +275,11 @@ impl Filesystem for AlgoFs {
                             }
 
                             for (i, child_attr) in children.iter().enumerate() {
-                                let ref child_path = self.paths[(child_attr.ino-1) as usize];
-                                reply.add(child_attr.ino, (i+1) as u64, child_attr.kind, get_basename(child_path));
+                                let ref child_path = self.paths[(child_attr.ino - 1) as usize];
+                                reply.add(child_attr.ino,
+                                          (i + 1) as u64,
+                                          child_attr.kind,
+                                          get_basename(child_path));
                             }
                             reply.ok();
                         }
@@ -275,7 +294,7 @@ impl Filesystem for AlgoFs {
                     println!("inode not found: {}", ino);
                     reply.error(ENOENT);
                 }
-            }
+            },
         }
     }
 }
@@ -306,6 +325,5 @@ fn get_basename(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn it_works() {
-    }
+    fn it_works() {}
 }
