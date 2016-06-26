@@ -1,23 +1,20 @@
+extern crate algorithmia;
 extern crate fuse;
 extern crate libc;
 extern crate time;
-extern crate algorithmia;
 
 use algorithmia::*;
 use algorithmia::data::*;
+use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
+use libc::{ENOENT, EINTR};
+use std::collections::HashMap;
 use std::env;
 use std::path::Path;
-use libc::{ENOENT, EINTR};
 use time::Timespec;
-use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
-use std::collections::HashMap;
+
+// 2015-03-12 00:00 PST Algorithmia Launch
+const DEFAULT_TIME: Timespec = Timespec { sec: 1426147200, nsec: 0 };
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
-
-const CREATE_TIME: Timespec = Timespec {
-    sec: 1381237736,
-    nsec: 0,
-};    // 2013-10-08 08:56
-
 
 pub struct AlgoFs {
     // indexed by inode-1
@@ -44,10 +41,10 @@ impl AlgoFs {
             ino: 1,
             size: 0,
             blocks: 0,
-            atime: CREATE_TIME,
-            mtime: CREATE_TIME,
-            ctime: CREATE_TIME,
-            crtime: CREATE_TIME,
+            atime: DEFAULT_TIME,
+            mtime: DEFAULT_TIME,
+            ctime: DEFAULT_TIME,
+            crtime: DEFAULT_TIME,
             kind: FileType::Directory,
             perm: 0o550,
             nlink: 2,
@@ -60,10 +57,10 @@ impl AlgoFs {
             ino: 2,
             size: 0,
             blocks: 0,
-            atime: CREATE_TIME,
-            mtime: CREATE_TIME,
-            ctime: CREATE_TIME,
-            crtime: CREATE_TIME,
+            atime: DEFAULT_TIME,
+            mtime: DEFAULT_TIME,
+            ctime: DEFAULT_TIME,
+            crtime: DEFAULT_TIME,
             kind: FileType::Directory,
             perm: 0o550,
             nlink: 2,
@@ -130,7 +127,7 @@ impl AlgoFs {
         let inos = my_dir.list()
             .map(|entry_result| {
                 match entry_result {
-                    Ok(DirEntry::Dir(d)) => self.insert_dir(&uri_to_path(&d.to_data_uri()), CREATE_TIME),
+                    Ok(DirEntry::Dir(d)) => self.insert_dir(&uri_to_path(&d.to_data_uri()), DEFAULT_TIME),
                     Ok(DirEntry::File(f)) => self.insert_file(&uri_to_path(&f.to_data_uri()),
                                                               Timespec::new(f.last_modified.timestamp(), 0),
                                                               f.size),
