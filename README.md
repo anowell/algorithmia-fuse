@@ -9,10 +9,10 @@ Maybe this will get a real explanation at some point, but for now, figure it out
 
 ## Progress
 - [x] Basic downward dir traversal
-- [ ] Basic upward dir traversal
+- [x] Basic upward dir traversal
 - [ ] Getting attributes for a file that hasn't been traversed
 - [ ] Reading files
 - [ ] Writing files
 - [ ] Deleting files and dirs
 - [ ] Making directories
-- [ ] All the hard problems like caching, large files, large directories, inode limits, optimizing  
+- [ ] All the hard problems like caching, large files, large directories, inode limits, optimizing

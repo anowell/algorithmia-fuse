@@ -2,11 +2,13 @@ extern crate algorithmia;
 extern crate fuse;
 extern crate libc;
 extern crate time;
+extern crate sequence_trie;
 
 use algorithmia::*;
 use algorithmia::data::*;
 use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
-use libc::{ENOENT, EINTR};
+use libc::ENOENT;
+use sequence_trie::SequenceTrie;
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
@@ -16,15 +18,29 @@ use time::Timespec;
 const DEFAULT_TIME: Timespec = Timespec { sec: 1426147200, nsec: 0 };
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
 
+#[derive(Debug, Clone)]
+struct TrieNode {
+    ino: u64,
+    visited: bool
+}
+impl TrieNode {
+    fn new(ino: u64) -> TrieNode {
+        TrieNode {
+            ino: ino,
+            visited: false,
+        }
+    }
+}
+
 pub struct AlgoFs {
     // indexed by inode-1
     inodes: Vec<FileAttr>,
     // indexed by inode-1
     paths: Vec<String>,
     /// map of inodes to to data buffers - indexed by inode (NOT inode-1)
-    _cache: HashMap<u64, Vec<u8>>, //
-    /// map of inodes to child inodes -  indexed by inode (NOT inode-1) - TODO: use a trie
-    children: HashMap<u64, Vec<u64>>,
+    _cache: HashMap<u64, Vec<u8>>,
+    /// trie mapping path segments (e.g. (["data", "foo", "bar.txt"]`) to inode values
+    fs_trie: SequenceTrie<String, TrieNode>,
     client: Algorithmia,
     uid: u32,
     gid: u32,
@@ -72,19 +88,19 @@ impl AlgoFs {
 
         let mut inodes = Vec::with_capacity(1024);
         let mut paths = Vec::with_capacity(1024);
-        let mut children = HashMap::new();
+        let mut fs_trie = SequenceTrie::new();
         inodes.push(adfs_root);
         inodes.push(data_root);
         paths.push("".into());
         paths.push("data".into());
-        children.insert(1, vec![2]);
+        fs_trie.insert(&path_to_prefix("data"), TrieNode::new(2));
 
         let adfs = AlgoFs {
             client: client,
             inodes: inodes,
             paths: paths,
             _cache: HashMap::new(),
-            children: children,
+            fs_trie: fs_trie,
             uid: uid,
             gid: gid,
         };
@@ -97,12 +113,16 @@ impl AlgoFs {
             return Ok(vec![]);
         }
 
-        match self.children.get(&ino) {
-            Some(children) => Ok(children.iter()
-                .map(|c_ino| self.inodes[(c_ino - 1) as usize].clone())
-                .collect()),
-            None => Err(format!("Cache miss - should not have called `cache_listdir`")),
-        }
+        let ref dir_path = self.paths[(ino-1) as usize];
+        let dir_key = path_to_prefix(dir_path);
+        let node = try!(self.fs_trie.get_node(&dir_key).ok_or("Cache miss - should not have called `cache_listdir`".to_string()));
+
+        let attrs = node.children.values()
+            .filter_map(|ref c| c.value.clone().map(|n| n.ino) )
+            .map(|c_ino| self.inodes[(c_ino - 1) as usize].clone())
+            .collect::<Vec<FileAttr>>();
+
+        Ok(attrs)
     }
 
     // TODO: support a page/offset type of arg?
@@ -141,10 +161,14 @@ impl AlgoFs {
             .filter(|ino| *ino != 0)
             .collect::<Vec<_>>();
 
-        // Update children cache so we don't hammer the API
-        self.children.insert(ino, inos);
-        println!("added to children: {:?}", self.children);
-        Ok(self.children[&(ino)].iter().map(|ino| self.inodes[(ino - 1) as usize].clone()).collect())
+        {
+            // Mark this node visited
+            let dir_prefix = path_to_prefix(&self.paths[(ino-1) as usize]);
+            let mut dir_node = self.fs_trie.get_mut(&dir_prefix).expect("node missing for dir just listed");
+            dir_node.visited = true;
+        }
+
+        Ok(inos.iter().map(|ino| self.inodes[(ino - 1) as usize].clone()).collect())
     }
 
     fn insert_dir(&mut self, path: &str, mtime: Timespec) -> u64 {
@@ -166,6 +190,7 @@ impl AlgoFs {
             flags: 0,
         });
         self.paths.push(path.to_string());
+        self.fs_trie.insert(&path_to_prefix(path), TrieNode::new(ino));
         ino
     }
 
@@ -189,41 +214,31 @@ impl AlgoFs {
         });
 
         self.paths.push(path.to_string());
+        self.fs_trie.insert(&path_to_prefix(path), TrieNode::new(ino));
         ino
     }
 }
 
 impl Filesystem for AlgoFs {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEntry) {
-        println!("lookup: {} -> {}", parent, name.to_str().unwrap());
-        match (parent, name.to_str()) {
-            (1, Some("")) => reply.entry(&TTL, &self.inodes[0], 0),
-            (1, Some("data")) => reply.entry(&TTL, &self.inodes[1], 0),
+        let name = name.to_string_lossy();
+        match (parent, name.as_ref()) {
+            (1, "") => reply.entry(&TTL, &self.inodes[0], 0),
+            (1, "data") => reply.entry(&TTL, &self.inodes[1], 0),
             (1, _) => reply.error(ENOENT), // TODO: check if connector exists, and cache that
-            (_, Some(name)) => {
-                match self.children.get(&parent) {
-                    Some(children) => {
-                        let ref parent_path = self.paths[(parent - 1) as usize];
-                        match children.iter().find(|child_ino| {
-                            self.paths[(*child_ino - 1) as usize] == format!("{}/{}", parent_path, name)
-                        }) {
-                            Some(child_ino) => reply.entry(&TTL, &self.inodes[(child_ino - 1) as usize], 0),
-                            None => {
-                                println!("lookup missing from cache: {} -> {}", parent, name);
-                                reply.error(ENOENT);
-                            }
-                        }
-                    }
+            _ => {
+                let ref parent_path = self.paths[(parent - 1) as usize];
+                let child_path = format!("{}/{}", parent_path, name);
+                let child_segment = path_to_prefix(&child_path);
+                match self.fs_trie.get(&child_segment) {
+                    Some(child) => reply.entry(&TTL, &self.inodes[(child.ino - 1) as usize], 0),
                     None => {
                         // TODO: get metadata from algorithmia
+                        // let parent_segment = path_to_prefix(parent_path);
                         println!("not-cached lookup: {} -> {}", parent, name);
                         reply.error(ENOENT);
                     }
                 }
-            }
-            (_, None) => {
-                println!("unnamed lookup for parent: {}", parent);
-                reply.error(ENOENT);
             }
         };
     }
@@ -248,6 +263,11 @@ impl Filesystem for AlgoFs {
     }
 
     fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, mut reply: ReplyDirectory) {
+        if offset > 0 {
+            reply.ok();
+            return;
+        }
+
         match (ino, offset) {
             (1, 0) => {
                 reply.add(1, 0, FileType::Directory, ".");
@@ -258,23 +278,29 @@ impl Filesystem for AlgoFs {
             (1, _) => reply.ok(),
             _ => match self.inodes.len() >= (ino as usize) {
                 true => {
-                    let children_res = match self.children.contains_key(&ino) {
+                    let dir_prefix = path_to_prefix(&self.paths[(ino-1) as usize]);
+                    let dir_visited  = self.fs_trie.get(&dir_prefix).map(|n| n.visited).unwrap_or(false);
+                    let children_res  = match dir_visited {
                         true => self.cache_listdir(ino, offset),
                         false => self.algo_listdir(ino, offset),
                     };
+
+                    let parent_ino = self.fs_trie.get_ancestor(&dir_prefix)
+                                         .expect("TODO: insert parent inode if not previously known")
+                                         .ino
+                                         .clone();
 
                     match children_res {
                         Ok(children) => {
                             if offset == 0 {
                                 reply.add(ino, 0, FileType::Directory, ".");
-                                // TODO: fix offset i+2 when '..' parent dir is supported
-                                // reply.add(get_parent(...), 1, FileType::Directory, "..");
+                                reply.add(parent_ino, 1, FileType::Directory, "..");
                             }
 
                             for (i, child_attr) in children.iter().enumerate() {
                                 let ref child_path = self.paths[(child_attr.ino - 1) as usize];
                                 reply.add(child_attr.ino,
-                                          (i + 1) as u64,
+                                          (i + 2) as u64,
                                           child_attr.kind,
                                           get_basename(child_path));
                             }
@@ -282,7 +308,7 @@ impl Filesystem for AlgoFs {
                         }
                         Err(err) => {
                             println!("readdir error: {}", err);
-                            reply.error(EINTR);
+                            reply.error(ENOENT);
                         }
                     }
 
@@ -296,7 +322,7 @@ impl Filesystem for AlgoFs {
     }
 }
 
-fn path_to_uri(path: &str) -> String {
+pub fn path_to_uri(path: &str) -> String {
     let parts: Vec<_> = path.splitn(2, "/").collect();
     match parts.len() {
         1 => format!("{}://", parts[0]),
@@ -305,13 +331,20 @@ fn path_to_uri(path: &str) -> String {
     }
 }
 
-fn uri_to_path(uri: &str) -> String {
+pub fn uri_to_path(uri: &str) -> String {
     let parts: Vec<_> = uri.splitn(2, "://").collect();
     match parts.len() {
+        1 if parts[0].is_empty() => "data".to_string(),
         1 => format!("data/{}", parts[0]),
+        2 if parts[1].is_empty() => parts[0].to_string(),
         2 => parts.join("/"),
         _ => unreachable!(),
     }
+}
+
+
+pub fn path_to_prefix(path: &str) -> Vec<String> {
+    path.split_terminator("/").map(String::from).collect()
 }
 
 fn get_basename(path: &str) -> String {
@@ -321,6 +354,31 @@ fn get_basename(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn it_works() {}
+    fn test_path_to_uri() {
+        assert_eq!(&*path_to_uri("data"), "data://");
+        assert_eq!(&*path_to_uri("data/foo"), "data://foo");
+        assert_eq!(&*path_to_uri("data/foo/bar.txt"), "data://foo/bar.txt");
+    }
+
+    #[test]
+    fn test_uri_to_path() {
+        assert_eq!(&*uri_to_path("data://"), "data");
+        assert_eq!(&*uri_to_path("data://foo"), "data/foo");
+        assert_eq!(&*uri_to_path("data://foo/bar.txt"), "data/foo/bar.txt");
+    }
+
+    fn assert_segment(actual: PathSegments, expected: Vec<&'static str>) {
+        assert_eq!(actual.0.iter().map(String::as_ref).collect::<Vec<&str>>(), expected);
+    }
+
+    #[test]
+    fn test_path_to_segments() {
+        assert_segment(path_to_segments("data"), vec!["data"]);
+        assert_segment(path_to_segments("data/foo"), vec!["data", "foo"]);
+        assert_segment(path_to_segments("data/foo/bar.txt"), vec!["data", "foo", "bar.txt"]);
+    }
+
 }
