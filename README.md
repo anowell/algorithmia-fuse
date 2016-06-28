@@ -12,7 +12,7 @@ Screenshots demonstrate walking the your Algorithmia data with basic `ls` operat
 ## Progress
 - [x] Basic downward dir traversal (Initial POC)
 - [x] Basic upward dir traversal (Refactored to use a sequential trie to easily lookup parent)
-- [ ] Getting attributes for a file that hasn't been traversed (i.e. handle cache misses in `lookup`)
+- [x] Getting attributes for a file that hasn't been traversed (i.e. handle cache misses in `lookup`)
 - [ ] Connector support (i.e. fix upstream rust client to sanely handle connector paths)
 - [ ] Reading files (i.e. impl `read` - gonna have to experiment a bit to understand how to leverage offset/size)
 - [ ] Writing files (i.e. impl `write`, `mknod` - probably `fsync` but need to experiment to better understand `flush`)

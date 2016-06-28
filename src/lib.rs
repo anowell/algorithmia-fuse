@@ -252,13 +252,18 @@ impl Filesystem for AlgoFs {
                 };
                 let child_segment = path_to_prefix(&child_path);
 
+                // Check child. If not in cache, check if parent has been traversed to decide if we should actually make API call
                 let child_ino = match self.fs_trie.get(&child_segment) {
-                    Some(child) => Some(child.ino), // reply.entry(&TTL, &self.inodes[(child.ino - 1) as usize], 0),
-                    None => None,
+                    Some(child_node) => Some(child_node.ino),
+                    None => match self.fs_trie.get_ancestor(&child_segment) {
+                        Some(parent_node) if parent_node.visited => Some(0), // TODO: not sure I want inode 0 to be an error case
+                        _ => None,
+                    }
                 };
 
                 // Awkward flow: MIR with non-lexical lifetimes can't arrive soon enough
                 match child_ino {
+                    Some(0) => reply.error(ENOENT),
                     Some(child_ino) => reply.entry(&TTL, &self.inodes[(child_ino - 1) as usize], 0),
                     None => {
                         match self.algo_lookup(&child_path) {
