@@ -50,7 +50,9 @@ impl AlgoFs {
     pub fn mount<P: AsRef<Path>>(path: &P) {
         // TODO: allow setting uid/gid for FS
         let api_key = env::var("ALGORITHMIA_API_KEY").expect("Must set ALGORITHMIA_API_KEY");
-        let client = Algorithmia::client(&*api_key);
+        let api_base = env::var("ALGORITHMIA_API").expect("Must set ALGORITHMIA_API");
+        let api_base_url = Url::parse(&api_base).expect("Failed to parse ALGORITHMIA_API as a URL");
+        let client = Algorithmia::alt_client(api_base_url, &*api_key);
         let uid = unsafe { libc::getuid() } as u32;
         let gid = unsafe { libc::getgid() } as u32;
         let adfs_root = FileAttr {
@@ -147,8 +149,8 @@ impl AlgoFs {
         let inos = my_dir.list()
             .map(|entry_result| {
                 match entry_result {
-                    Ok(DirEntry::Dir(d)) => self.insert_dir(&uri_to_path(&d.to_data_uri()), DEFAULT_TIME),
-                    Ok(DirEntry::File(f)) => self.insert_file(&uri_to_path(&f.to_data_uri()),
+                    Ok(DataObject::Dir(d)) => self.insert_dir(&uri_to_path(&d.to_data_uri()), DEFAULT_TIME),
+                    Ok(DataObject::File(f)) => self.insert_file(&uri_to_path(&f.to_data_uri()),
                                                               Timespec::new(f.last_modified.timestamp(), 0),
                                                               f.size),
                     Err(err) => {
@@ -169,6 +171,23 @@ impl AlgoFs {
         }
 
         Ok(inos.iter().map(|ino| self.inodes[(ino - 1) as usize].clone()).collect())
+    }
+
+    // TODO: support a page/offset type of arg?
+    fn algo_lookup(&mut self, path: &str) -> Result<FileAttr, String> {
+        match self.client.data(&path_to_uri(&path)).into_type() {
+            Ok(DataObject::Dir(_)) => {
+                let inserted_ino = self.insert_dir(&path, DEFAULT_TIME);
+                Ok(self.inodes[(inserted_ino - 1) as usize])
+            }
+            Ok(DataObject::File(f)) => {
+                let inserted_ino = self.insert_file(&path,
+                                    Timespec::new(f.last_modified.timestamp(), 0),
+                                    f.size);
+                Ok(self.inodes[(inserted_ino - 1) as usize])
+            }
+            Err(err) => Err(format!("into_type failed: {}", err)),
+        }
     }
 
     fn insert_dir(&mut self, path: &str, mtime: Timespec) -> u64 {
@@ -227,19 +246,32 @@ impl Filesystem for AlgoFs {
             (1, "data") => reply.entry(&TTL, &self.inodes[1], 0),
             (1, _) => reply.error(ENOENT), // TODO: check if connector exists, and cache that
             _ => {
-                let ref parent_path = self.paths[(parent - 1) as usize];
-                let child_path = format!("{}/{}", parent_path, name);
+                let child_path = {
+                    let ref parent_path = self.paths[(parent - 1) as usize];
+                    format!("{}/{}", parent_path, name)
+                };
                 let child_segment = path_to_prefix(&child_path);
-                match self.fs_trie.get(&child_segment) {
-                    Some(child) => reply.entry(&TTL, &self.inodes[(child.ino - 1) as usize], 0),
+
+                let child_ino = match self.fs_trie.get(&child_segment) {
+                    Some(child) => Some(child.ino), // reply.entry(&TTL, &self.inodes[(child.ino - 1) as usize], 0),
+                    None => None,
+                };
+
+                // Awkward flow: MIR with non-lexical lifetimes can't arrive soon enough
+                match child_ino {
+                    Some(child_ino) => reply.entry(&TTL, &self.inodes[(child_ino - 1) as usize], 0),
                     None => {
-                        // TODO: get metadata from algorithmia
-                        // let parent_segment = path_to_prefix(parent_path);
-                        println!("not-cached lookup: {} -> {}", parent, name);
-                        reply.error(ENOENT);
+                        match self.algo_lookup(&child_path) {
+                            Ok(attr) => reply.entry(&TTL, &attr, 0),
+                            Err(err) => {
+                                println!("lookup error - {}", err);
+                                reply.error(ENOENT);
+                            }
+                        }
                     }
                 }
             }
+
         };
     }
 
