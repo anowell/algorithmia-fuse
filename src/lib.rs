@@ -149,8 +149,8 @@ impl AlgoFs {
         let inos = my_dir.list()
             .map(|entry_result| {
                 match entry_result {
-                    Ok(DataObject::Dir(d)) => self.insert_dir(&uri_to_path(&d.to_data_uri()), DEFAULT_TIME),
-                    Ok(DataObject::File(f)) => self.insert_file(&uri_to_path(&f.to_data_uri()),
+                    Ok(DataItem::Dir(d)) => self.insert_dir(&uri_to_path(&d.to_data_uri()), DEFAULT_TIME, 0o750),
+                    Ok(DataItem::File(f)) => self.insert_file(&uri_to_path(&f.to_data_uri()),
                                                               Timespec::new(f.last_modified.timestamp(), 0),
                                                               f.size),
                     Err(err) => {
@@ -175,23 +175,26 @@ impl AlgoFs {
 
     // TODO: support a page/offset type of arg?
     fn algo_lookup(&mut self, path: &str) -> Result<FileAttr, String> {
-        match self.client.data(&path_to_uri(&path)).into_type() {
-            Ok(DataObject::Dir(_)) => {
-                let inserted_ino = self.insert_dir(&path, DEFAULT_TIME);
+        let uri = path_to_uri(&path);
+        println!("algo_lookup: {}", uri);
+        match self.client.data(&uri).into_type() {
+            Ok(DataItem::Dir(_)) => {
+                let inserted_ino = self.insert_dir(&path, DEFAULT_TIME, 0o750); // TODO: API should indicate not listable
                 Ok(self.inodes[(inserted_ino - 1) as usize])
             }
-            Ok(DataObject::File(f)) => {
+            Ok(DataItem::File(f)) => {
                 let inserted_ino = self.insert_file(&path,
                                     Timespec::new(f.last_modified.timestamp(), 0),
                                     f.size);
                 Ok(self.inodes[(inserted_ino - 1) as usize])
             }
-            Err(err) => Err(format!("into_type failed: {}", err)),
+            Err(err) => Err(err.to_string()),
         }
     }
 
-    fn insert_dir(&mut self, path: &str, mtime: Timespec) -> u64 {
+    fn insert_dir(&mut self, path: &str, mtime: Timespec, perm: u16) -> u64 {
         let ino = self.inodes.len() as u64 + 1;
+
         self.inodes.push(FileAttr {
             ino: ino,
             size: 0,
@@ -201,7 +204,7 @@ impl AlgoFs {
             ctime: mtime,
             crtime: mtime,
             kind: FileType::Directory,
-            perm: 0o750,
+            perm: perm,
             nlink: 2,
             uid: self.uid,
             gid: self.gid,
@@ -209,6 +212,8 @@ impl AlgoFs {
             flags: 0,
         });
         self.paths.push(path.to_string());
+        println!("insert_dir: {} {}", ino, path);
+
         self.fs_trie.insert(&path_to_prefix(path), TrieNode::new(ino));
         ino
     }
@@ -241,10 +246,14 @@ impl AlgoFs {
 impl Filesystem for AlgoFs {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEntry) {
         let name = name.to_string_lossy();
+        println!("lookup: {}/{}", parent, name);
         match (parent, name.as_ref()) {
             (1, "") => reply.entry(&TTL, &self.inodes[0], 0),
             (1, "data") => reply.entry(&TTL, &self.inodes[1], 0),
-            (1, _) => reply.error(ENOENT), // TODO: check if connector exists, and cache that
+            (1, connector) if !connector.starts_with("dropbox") && !connector.starts_with("s3") => {
+                // Filesystems look for a bunch of junk in the rootdir by default, so lets whitelist supported connector prefixes
+                reply.error(ENOENT);
+            }
             _ => {
                 let child_path = {
                     let ref parent_path = self.paths[(parent - 1) as usize];
@@ -256,14 +265,18 @@ impl Filesystem for AlgoFs {
                 let child_ino = match self.fs_trie.get(&child_segment) {
                     Some(child_node) => Some(child_node.ino),
                     None => match self.fs_trie.get_ancestor(&child_segment) {
-                        Some(parent_node) if parent_node.visited => Some(0), // TODO: not sure I want inode 0 to be an error case
+                        // TODO: not sure I want inode 0 to be an error case, but gets around non-lexical lifetimes for now
+                        Some(parent_node) if parent_node.visited && parent_node.ino != 1 => Some(0),
                         _ => None,
                     }
                 };
 
                 // Awkward flow: MIR with non-lexical lifetimes can't arrive soon enough
                 match child_ino {
-                    Some(0) => reply.error(ENOENT),
+                    Some(0) => {
+                        println!("lookup - short-circuiting cache miss");
+                        reply.error(ENOENT);
+                    }
                     Some(child_ino) => reply.entry(&TTL, &self.inodes[(child_ino - 1) as usize], 0),
                     None => {
                         match self.algo_lookup(&child_path) {
@@ -360,7 +373,11 @@ impl Filesystem for AlgoFs {
 }
 
 pub fn path_to_uri(path: &str) -> String {
-    let parts: Vec<_> = path.splitn(2, "/").collect();
+    let parts: Vec<_> = match path.starts_with("/") {
+        true => &path[1..],
+        false => &path,
+    }.splitn(2, "/").collect();
+
     match parts.len() {
         1 => format!("{}://", parts[0]),
         2 => parts.join("://"),
@@ -405,17 +422,6 @@ mod tests {
         assert_eq!(&*uri_to_path("data://"), "data");
         assert_eq!(&*uri_to_path("data://foo"), "data/foo");
         assert_eq!(&*uri_to_path("data://foo/bar.txt"), "data/foo/bar.txt");
-    }
-
-    fn assert_segment(actual: PathSegments, expected: Vec<&'static str>) {
-        assert_eq!(actual.0.iter().map(String::as_ref).collect::<Vec<&str>>(), expected);
-    }
-
-    #[test]
-    fn test_path_to_segments() {
-        assert_segment(path_to_segments("data"), vec!["data"]);
-        assert_segment(path_to_segments("data/foo"), vec!["data", "foo"]);
-        assert_segment(path_to_segments("data/foo/bar.txt"), vec!["data", "foo", "bar.txt"]);
     }
 
 }
