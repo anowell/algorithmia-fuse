@@ -15,8 +15,8 @@ Screenshots demonstrate walking the your Algorithmia data with basic `ls` operat
   - [x] Basic upward dir traversal (Refactored to use a sequential trie to easily lookup parent)
   - [x] Getting attributes for a file that hasn't been traversed (i.e. handle cache misses in `lookup`)
   - [ ] Connector support (very limited support until some upstream issues are address - tracking in #1)
-- [ ] Writeable Filesystem
   - [ ] Reading files (i.e. impl `read` - gonna have to experiment a bit to understand how to leverage offset/size)
+- [ ] Writeable Filesystem
   - [ ] Writing files (i.e. impl `write`, `mknod` - probably `fsync` but need to experiment to better understand `flush`)
   - [ ] Deleting files and dirs (i.e. impl `rmdir`, `unlink`, and probably `forget` which will require refactoring inode storage)
   - [ ] Making directories (i.e. impl `mkdir`)
