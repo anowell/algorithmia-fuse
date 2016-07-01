@@ -21,6 +21,6 @@ Screenshots demonstrate basic traversal and read operations from CLI and file ex
   - [ ] Deleting files and dirs (i.e. impl `rmdir`, `unlink`, and probably `forget` which will require refactoring inode storage)
   - [ ] Making directories (i.e. impl `mkdir`)
 - [ ] Production Filesystem
-  - [ ] All the hard problems like sane caching, large files, large directories, inode limits, optimizing
+  - [ ] All the hard problems like sane caching, multi-process data races, large files, large directories, inode limits, optimizing
 
 Crazy idea: Experiment with representing algorithms as `FileType::NamedPipe` under `<mountpoint>/algorithms/<username>/<algoname>/<version>` so you can have one handle that pipes data to an algorithm and another handle that receives responses. (e.g. `echo 'Are you pondering?' > ~/algofs/algorithms/anowell/Pinky/latest`)
