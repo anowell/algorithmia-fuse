@@ -3,7 +3,7 @@ Experimental: FUSE-based Algorithmia FileSystem
 
 A user-mode virtual filesystem backed by the Algorithmia API. Basically, it handles filesystem requests by turning them into API calls and lazily building a local cache of remote resources. The end result is that you can mount Algorithmia data to a local directory, and use standard file operations to work with Algorithmia data (all the standard caveats of networked filesystems apply).
 
-Screenshots demonstrate walking the your Algorithmia data with basic `ls` operations or a file explorer:
+Screenshots demonstrate basic traversal and read operations from CLI and file explorer:
 
 ![Screenshot](https://dl.dropboxusercontent.com/u/39033486/Algorithmia/algofs-walk-and-grep.png)
 
