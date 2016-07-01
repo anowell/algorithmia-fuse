@@ -14,7 +14,7 @@ Screenshots demonstrate basic traversal and read operations from CLI and file ex
   - [x] Basic downward dir traversal (Initial POC)
   - [x] Basic upward dir traversal (Refactored to use a sequential trie to easily lookup parent)
   - [x] Getting attributes for a file that hasn't been traversed (i.e. handle cache misses in `lookup`)
-  - [x] Connector support (Very limited by API - see Issue #1)
+  - [x] Connector support (Very limited by API - see [ Issue #1](../../issues/1))
   - [x] Basic file reading
 - [ ] Writeable Filesystem
   - [ ] Writing files (i.e. impl `write`, `mknod` - probably `fsync` but need to experiment to better understand `flush`)
