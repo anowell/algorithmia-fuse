@@ -5,18 +5,16 @@ A user-mode virtual filesystem backed by the Algorithmia API. Basically, it hand
 
 Screenshots demonstrate walking the your Algorithmia data with basic `ls` operations or a file explorer:
 
-![Screenshot](https://dl.dropboxusercontent.com/u/39033486/Algorithmia/algofs-walking.png)
+![Screenshot](https://dl.dropboxusercontent.com/u/39033486/Algorithmia/algofs-walk-and-grep.png)
 
-![Screenshot](https://dl.dropboxusercontent.com/u/39033486/Algorithmia/algofs-explore.png)
+![Screenshot](https://dl.dropboxusercontent.com/u/39033486/Algorithmia/algofs-reading-files.png)
 
 ## Progress
-- [ ] Read-Only Filesystem
+- [x] Read-Only Filesystem
   - [x] Basic downward dir traversal (Initial POC)
   - [x] Basic upward dir traversal (Refactored to use a sequential trie to easily lookup parent)
   - [x] Getting attributes for a file that hasn't been traversed (i.e. handle cache misses in `lookup`)
-  - [ ] Connector support
-    - [x] Update upstream client to fully work with connectors (incl. `parent()`)
-    - [ ] Provide lookup for path-restricted files (See Issue #1)
+  - [x] Connector support (Very limited by API - see Issue #1)
   - [x] Basic file reading
 - [ ] Writeable Filesystem
   - [ ] Writing files (i.e. impl `write`, `mknod` - probably `fsync` but need to experiment to better understand `flush`)
