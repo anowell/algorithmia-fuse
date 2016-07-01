@@ -39,7 +39,7 @@ pub struct AlgoFs {
     // indexed by inode-1
     paths: Vec<String>,
     /// map of inodes to to data buffers - indexed by inode (NOT inode-1)
-    _cache: HashMap<u64, Vec<u8>>,
+    cache: HashMap<u64, Vec<u8>>,
     /// trie mapping path segments (e.g. (["data", "foo", "bar.txt"]`) to inode values
     fs_trie: SequenceTrie<String, TrieNode>,
     client: Algorithmia,
@@ -102,7 +102,7 @@ impl AlgoFs {
             client: client,
             inodes: inodes,
             paths: paths,
-            _cache: HashMap::new(),
+            cache: HashMap::new(),
             fs_trie: fs_trie,
             uid: uid,
             gid: gid,
@@ -200,7 +200,7 @@ impl AlgoFs {
         match self.client.file(&uri).get() {
             Ok(mut response) => {
                 let mut buffer = Vec::new();
-                response.read_to_end(&mut buffer);
+                let _ = response.read_to_end(&mut buffer);
                 Ok(buffer)
             }
             Err(err) => Err(err.to_string()),
@@ -320,30 +320,46 @@ impl Filesystem for AlgoFs {
     }
 
     // TODO: don't buffer the whole thing. Just store the DataResponse and read size at a time as long as offsets line up
-    // struct CachedFile { response: DataResponse, offset: u64, len: u64}
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, size: u32, reply: ReplyData) {
         println!("read {}[{}..+{}]", ino, offset, size);
-        if offset == 0 {
+
+        if offset == 0 || !self.cache.contains_key(&ino) {
             let path = self.paths[(ino - 1) as usize].clone();
-            match self.algo_read(&path) {
-                Ok(buffer) => {
-                    let end_offset = offset + size as u64;
-                    match buffer.len() {
-                        len if len as u64 > offset + size as u64 => reply.data(&buffer[(offset as usize)..(end_offset as usize)]),
-                        len if len as u64 > offset => reply.data(&buffer[(offset as usize)..]),
-                        len => {
-                            println!("attempted read beyond buffer for {} len={} offset={} size={}", &path, len, offset, size);
-                            reply.error(ENOENT);
-                        }
-                    }
-                }
+            let response = self.algo_read(&path);
+            match response {
+                Ok(buffer) => self.cache.insert(ino, buffer),
                 Err(err) => {
                     println!("read error: {}", err);
                     reply.error(ENOENT);
+                    return
+                }
+            };
+        }
+
+        let reset_cache = {
+            let buffer = self.cache.get(&ino).unwrap();
+
+            let end_offset = offset + size as u64;
+            match buffer.len() {
+                len if len as u64 > offset + size as u64 => {
+                    reply.data(&buffer[(offset as usize)..(end_offset as usize)]);
+                    false
+                }
+                len if len as u64 > offset => {
+                    reply.data(&buffer[(offset as usize)..]);
+                    true
+                }
+                len => {
+                    println!("attempted read beyond buffer for ino {} len={} offset={} size={}", ino, len, offset, size);
+                    reply.error(ENOENT);
+                    true
                 }
             }
-        } else {
-            reply.error(ENOENT);
+        };
+
+        if reset_cache {
+            // FIXME: data race if 2 processes were reading the same file.
+            let _ = self.cache.remove(&ino);
         }
     }
 

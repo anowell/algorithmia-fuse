@@ -17,9 +17,7 @@ Screenshots demonstrate walking the your Algorithmia data with basic `ls` operat
   - [ ] Connector support
     - [x] Update upstream client to fully work with connectors (incl. `parent()`)
     - [ ] Provide lookup for path-restricted files (See Issue #1)
-  - [ ] Reading files
-    - [x] Single seekless read (experimentally capped around 100k)
-    - [ ] Chunked read (i.e. caching download for seeking)
+  - [x] Basic file reading
 - [ ] Writeable Filesystem
   - [ ] Writing files (i.e. impl `write`, `mknod` - probably `fsync` but need to experiment to better understand `flush`)
   - [ ] Deleting files and dirs (i.e. impl `rmdir`, `unlink`, and probably `forget` which will require refactoring inode storage)
