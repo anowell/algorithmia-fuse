@@ -14,8 +14,12 @@ Screenshots demonstrate walking the your Algorithmia data with basic `ls` operat
   - [x] Basic downward dir traversal (Initial POC)
   - [x] Basic upward dir traversal (Refactored to use a sequential trie to easily lookup parent)
   - [x] Getting attributes for a file that hasn't been traversed (i.e. handle cache misses in `lookup`)
-  - [ ] Connector support (very limited support until some upstream issues are address - tracking in #1)
-  - [ ] Reading files (i.e. impl `read` - gonna have to experiment a bit to understand how to leverage offset/size)
+  - [ ] Connector support
+    - [x] Update upstream client to fully work with connectors (incl. `parent()`)
+    - [ ] Provide lookup for path-restricted files (See Issue #1)
+  - [ ] Reading files
+    - [x] Single seekless read (experimentally capped around 100k)
+    - [ ] Chunked read (i.e. caching download for seeking)
 - [ ] Writeable Filesystem
   - [ ] Writing files (i.e. impl `write`, `mknod` - probably `fsync` but need to experiment to better understand `flush`)
   - [ ] Deleting files and dirs (i.e. impl `rmdir`, `unlink`, and probably `forget` which will require refactoring inode storage)

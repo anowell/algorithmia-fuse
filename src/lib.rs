@@ -11,6 +11,7 @@ use libc::ENOENT;
 use sequence_trie::SequenceTrie;
 use std::collections::HashMap;
 use std::env;
+use std::io::Read;
 use std::path::Path;
 use time::Timespec;
 
@@ -192,6 +193,21 @@ impl AlgoFs {
         }
     }
 
+    // TODO: support a page/offset type of arg?
+    fn algo_read(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        let uri = path_to_uri(&path);
+        println!("algo_read: {}", uri);
+        match self.client.file(&uri).get() {
+            Ok(mut response) => {
+                let mut buffer = Vec::new();
+                response.read_to_end(&mut buffer);
+                Ok(buffer)
+            }
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+
     fn insert_dir(&mut self, path: &str, mtime: Timespec, perm: u16) -> u64 {
         let ino = self.inodes.len() as u64 + 1;
 
@@ -303,10 +319,29 @@ impl Filesystem for AlgoFs {
         };
     }
 
-    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, _size: u32, reply: ReplyData) {
-        println!("read {}", ino);
-        if ino == 2 {
-            reply.data(&"hello world".as_bytes()[offset as usize..]);
+    // TODO: don't buffer the whole thing. Just store the DataResponse and read size at a time as long as offsets line up
+    // struct CachedFile { response: DataResponse, offset: u64, len: u64}
+    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, size: u32, reply: ReplyData) {
+        println!("read {}[{}..+{}]", ino, offset, size);
+        if offset == 0 {
+            let path = self.paths[(ino - 1) as usize].clone();
+            match self.algo_read(&path) {
+                Ok(buffer) => {
+                    let end_offset = offset + size as u64;
+                    match buffer.len() {
+                        len if len as u64 > offset + size as u64 => reply.data(&buffer[(offset as usize)..(end_offset as usize)]),
+                        len if len as u64 > offset => reply.data(&buffer[(offset as usize)..]),
+                        len => {
+                            println!("attempted read beyond buffer for {} len={} offset={} size={}", &path, len, offset, size);
+                            reply.error(ENOENT);
+                        }
+                    }
+                }
+                Err(err) => {
+                    println!("read error: {}", err);
+                    reply.error(ENOENT);
+                }
+            }
         } else {
             reply.error(ENOENT);
         }
