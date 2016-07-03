@@ -1,9 +1,8 @@
 use fuse::{FileType, FileAttr};
-use libc::ENOENT;
 use sequence_trie::SequenceTrie;
 use std::collections::HashMap;
-use std::cell::{RefCell, Ref, RefMut};
-use std::rc::Rc;
+use std::ops::{Index, IndexMut};
+use super::DEFAULT_TIME;
 
 #[derive(Debug, Clone)]
 pub struct Inode {
@@ -20,10 +19,6 @@ impl Inode {
             visited: false,
         }
     }
-
-    // fn set_visited(&mut self) {
-    //     unimplemented!();
-    // }
 }
 
 pub struct InodeStore {
@@ -32,11 +27,35 @@ pub struct InodeStore {
 }
 
 impl InodeStore {
-    pub fn new() -> InodeStore {
-        InodeStore {
+    pub fn new(perm: u16, uid: u32, gid: u32) -> InodeStore {
+        let mut store = InodeStore {
             inode_map: HashMap::new(),
             ino_trie: SequenceTrie::new(),
-        }
+        };
+
+        let fs_root = FileAttr {
+            ino: 1,
+            size: 0,
+            blocks: 0,
+            atime: DEFAULT_TIME,
+            mtime: DEFAULT_TIME,
+            ctime: DEFAULT_TIME,
+            crtime: DEFAULT_TIME,
+            kind: FileType::Directory,
+            perm: perm,
+            nlink: 2,
+            uid: uid,
+            gid: gid,
+            rdev: 0,
+            flags: 0,
+        };
+
+        store.insert(Inode::new("", fs_root));
+        store
+    }
+
+    pub fn len(&self) -> usize {
+        self.inode_map.len()
     }
 
     pub fn get(&self, ino: u64) -> Option<&Inode> {
@@ -73,12 +92,19 @@ impl InodeStore {
         }
     }
 
+    // All inodes have a parent (root parent is root)
+    // Return value of None means the ino wasn't found
     pub fn parent(&self, ino: u64) -> Option<&Inode> {
+        // parent of root is root
+        if ino == 1 {
+            return self.get(1);
+        }
+
         self.get(ino)
             .and_then(|inode| {
                 let sequence = path_to_sequence(&inode.path);
                 match sequence.len() {
-                    0 | 1 => None,
+                    1 => self.get(1),
                     len => self.ino_trie.get(&sequence[0..(len-1)]).and_then(|p_ino| self.get(*p_ino) )
                 }
             })
@@ -106,20 +132,38 @@ impl InodeStore {
         let ino = inode.attr.ino;
         let sequence = path_to_sequence(&inode.path);
 
-        // TODO: verify that either both insert or both update
-        let _ = self.inode_map.insert(ino, inode);
-        let _ = self.ino_trie.insert(&sequence, ino);
+        // CONSIDER: we could just block inserts that would cause inconsistent store
+        // assert_eq!(
+        //     self.inode_map.get(&ino).map(|i| i.attr.ino),
+        //     self.ino_trie.get(&sequence)
+        // );
+
+        let new_map_insert = self.inode_map.insert(ino, inode).is_none();
+        let new_trie_insert = self.ino_trie.insert(&sequence, ino);
+
+        if new_map_insert != new_trie_insert {
+            panic!("inconsistent inode store after inserting {} ({})", ino, self[ino].path);
+        }
     }
 }
 
+impl Index<u64> for InodeStore {
+    type Output = Inode;
+
+    fn index<'a>(&'a self, index: u64) -> &'a Inode {
+        self.get(index).unwrap()
+    }
+}
+
+impl IndexMut<u64> for InodeStore {
+    fn index_mut<'a>(&'a mut self, index: u64) -> &'a mut Inode {
+        self.get_mut(index).unwrap()
+    }
+}
 
 fn path_to_sequence(path: &str) -> Vec<String> {
     path.split_terminator("/").map(String::from).collect()
 }
-
-// fn get_basename(path: &str) -> String {
-//     path.rsplitn(2, "/").next().unwrap().to_string()
-// }
 
 #[cfg(test)]
 mod tests {
@@ -166,37 +210,39 @@ mod tests {
     }
 
     fn build_basic_store() -> InodeStore {
-        let mut store = InodeStore::new();
-        store.insert(Inode::new("data", new_dir_attr(1)));
-        store.insert(Inode::new("data/foo.txt", new_file_attr(2)));
-        store.insert(Inode::new("data/bar.txt", new_file_attr(3)));
+        let mut store = InodeStore::new(0o750, 1000, 1000);
+        store.insert(Inode::new("data", new_dir_attr(2)));
+        store.insert(Inode::new("data/foo.txt", new_file_attr(3)));
+        store.insert(Inode::new("data/bar.txt", new_file_attr(4)));
         store
     }
 
     #[test]
     fn test_inode_store_get() {
         let store = build_basic_store();
-        assert_eq!(&store.get(1).unwrap().path, "data");
-        assert_eq!(&store.get(2).unwrap().path, "data/foo.txt");
+        assert_eq!(&store.get(1).unwrap().path, "");
+        assert_eq!(&store.get(2).unwrap().path, "data");
+        assert_eq!(&store.get(3).unwrap().path, "data/foo.txt");
     }
 
     #[test]
     fn test_inode_store_get_by_path() {
         let store = build_basic_store();
-        assert_eq!(store.get_by_path("data").unwrap().attr.ino, 1);
-        assert_eq!(store.get_by_path("data/foo.txt").unwrap().attr.ino, 2);
-        assert_eq!(store.get_by_path("data/bar.txt").unwrap().attr.ino, 3);
+        assert_eq!(store.get_by_path("").unwrap().attr.ino, 1);
+        assert_eq!(store.get_by_path("data").unwrap().attr.ino, 2);
+        assert_eq!(store.get_by_path("data/foo.txt").unwrap().attr.ino, 3);
+        assert_eq!(store.get_by_path("data/bar.txt").unwrap().attr.ino, 4);
     }
 
     #[test]
     fn test_inode_store_get_mut() {
         let mut store = build_basic_store();
         {
-            let mut inode = store.get_mut(2).unwrap();
+            let mut inode = store.get_mut(3).unwrap();
             assert_eq!(inode.attr.size, 42);
             inode.attr.size = 23;
         }
-        assert_eq!(store.get(2).unwrap().attr.size, 23);
+        assert_eq!(store.get(3).unwrap().attr.size, 23);
     }
 
     #[test]
@@ -213,22 +259,25 @@ mod tests {
     #[test]
     fn test_inode_store_parent() {
         let store = build_basic_store();
-        assert_eq!(&store.parent(2).unwrap().path, "data");
-        assert!(&store.parent(1).is_none());
+        assert_eq!(&store.parent(3).unwrap().path, "data");
+        assert_eq!(store.parent(2).unwrap().attr.ino, 1);
+        assert_eq!(store.parent(1).unwrap().attr.ino, 1);
+        assert!(&store.parent(999).is_none());
     }
 
     #[test]
     fn test_inode_store_children() {
         let store = build_basic_store();
-        assert_eq!(store.children(1).len(), 2);
-        assert_eq!(store.children(2).len(), 0);
+        assert_eq!(store.children(1).len(), 1);
+        assert_eq!(store.children(2).len(), 2);
+        assert_eq!(store.children(3).len(), 0);
     }
 
     #[test]
     fn test_inode_store_child() {
         let store = build_basic_store();
-        assert_eq!(store.child(1, "foo.txt").unwrap().path, "data/foo.txt");
-        assert!(store.child(1, "notfound").is_none());
+        assert_eq!(store.child(2, "foo.txt").unwrap().path, "data/foo.txt");
+        assert!(store.child(2, "notfound").is_none());
     }
 
 }

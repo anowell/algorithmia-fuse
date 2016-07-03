@@ -4,44 +4,27 @@ extern crate libc;
 extern crate time;
 extern crate sequence_trie;
 
+mod inode;
+
 use algorithmia::*;
 use algorithmia::data::*;
 use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
 use libc::ENOENT;
-use sequence_trie::SequenceTrie;
 use std::collections::HashMap;
 use std::env;
 use std::io::Read;
 use std::path::Path;
 use time::Timespec;
+use inode::{Inode, InodeStore};
 
 // 2015-03-12 00:00 PST Algorithmia Launch
-const DEFAULT_TIME: Timespec = Timespec { sec: 1426147200, nsec: 0 };
-const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
-
-#[derive(Debug, Clone)]
-struct TrieNode {
-    ino: u64,
-    visited: bool
-}
-impl TrieNode {
-    fn new(ino: u64) -> TrieNode {
-        TrieNode {
-            ino: ino,
-            visited: false,
-        }
-    }
-}
+pub const DEFAULT_TIME: Timespec = Timespec { sec: 1426147200, nsec: 0 };
+pub const DEFAULT_TTL: Timespec = Timespec { sec: 1, nsec: 0 };
 
 pub struct AlgoFs {
-    // indexed by inode-1
-    inodes: Vec<FileAttr>,
-    // indexed by inode-1
-    paths: Vec<String>,
+    inodes: InodeStore,
     /// map of inodes to to data buffers - indexed by inode (NOT inode-1)
     cache: HashMap<u64, Vec<u8>>,
-    /// trie mapping path segments (e.g. (["data", "foo", "bar.txt"]`) to inode values
-    fs_trie: SequenceTrie<String, TrieNode>,
     client: Algorithmia,
     uid: u32,
     gid: u32,
@@ -56,22 +39,7 @@ impl AlgoFs {
         let client = Algorithmia::alt_client(api_base_url, &*api_key);
         let uid = unsafe { libc::getuid() } as u32;
         let gid = unsafe { libc::getgid() } as u32;
-        let adfs_root = FileAttr {
-            ino: 1,
-            size: 0,
-            blocks: 0,
-            atime: DEFAULT_TIME,
-            mtime: DEFAULT_TIME,
-            ctime: DEFAULT_TIME,
-            crtime: DEFAULT_TIME,
-            kind: FileType::Directory,
-            perm: 0o550,
-            nlink: 2,
-            uid: uid,
-            gid: gid,
-            rdev: 0,
-            flags: 0,
-        };
+
         let data_root = FileAttr {
             ino: 2,
             size: 0,
@@ -89,105 +57,88 @@ impl AlgoFs {
             flags: 0,
         };
 
-        let mut inodes = Vec::with_capacity(1024);
-        let mut paths = Vec::with_capacity(1024);
-        let mut fs_trie = SequenceTrie::new();
-        inodes.push(adfs_root);
-        inodes.push(data_root);
-        paths.push("".into());
-        paths.push("data".into());
-        fs_trie.insert(&path_to_prefix("data"), TrieNode::new(2));
+        let mut inodes = InodeStore::new(0o550, uid, gid);
+        inodes.insert(Inode::new("data", data_root));
 
         let adfs = AlgoFs {
             client: client,
             inodes: inodes,
-            paths: paths,
             cache: HashMap::new(),
-            fs_trie: fs_trie,
             uid: uid,
             gid: gid,
         };
         fuse::mount(adfs, path, &[]);
     }
 
-    fn cache_listdir<'a>(&self, ino: u64, offset: u64) -> Result<Vec<FileAttr>, String> {
-        // TODO: support offset
-        if offset > 0 {
-            return Ok(vec![]);
+    fn cache_listdir<'a>(&'a self, ino: u64, offset: u64, mut reply: ReplyDirectory) {
+        for (i, child) in self.inodes.children(ino).iter().enumerate().skip(offset as usize) {
+            reply.add(child.attr.ino,
+                i as u64 + offset + 2,
+                child.attr.kind,
+                get_basename(&child.path));
         }
-
-        let ref dir_path = self.paths[(ino-1) as usize];
-        let dir_key = path_to_prefix(dir_path);
-        let node = try!(self.fs_trie.get_node(&dir_key).ok_or("Cache miss - should not have called `cache_listdir`".to_string()));
-
-        let attrs = node.children.values()
-            .filter_map(|ref c| c.value.clone().map(|n| n.ino) )
-            .map(|c_ino| self.inodes[(c_ino - 1) as usize].clone())
-            .collect::<Vec<FileAttr>>();
-
-        Ok(attrs)
+        reply.ok();
     }
 
     // TODO: support a page/offset type of arg?
-    fn algo_listdir(&mut self, ino: u64, offset: u64) -> Result<Vec<FileAttr>, String> {
+    fn algo_listdir<'a>(&'a mut self, ino: u64, offset: u64, mut reply: ReplyDirectory) {
         // TODO: support offset
         if offset > 0 {
-            return Ok(vec![]);
+            return reply.ok();
         }
 
-        let local_path = try!(self.paths
-                .get((ino - 1) as usize)
-                .ok_or(format!("path not found for inode {}", ino)))
-            .clone();
-        let path = path_to_uri(&local_path);
-        println!("Fetching algo dir listing for inode: {} (+{}): {} => {}",
+        let uri = {
+            let inode = self.inodes.get(ino).expect(&format!("path not found for inode {}", ino));
+            path_to_uri(&inode.path)
+        };
+
+        println!("Fetching algo dir listing for inode: {} (+{}) => {}",
                  ino,
                  offset,
-                 local_path,
-                 path);
-
-        let my_dir = self.client.dir(&path);
-        let inos = my_dir.list()
-            .map(|entry_result| {
-                match entry_result {
-                    Ok(DataItem::Dir(d)) => self.insert_dir(&uri_to_path(&d.to_data_uri()), DEFAULT_TIME, 0o750),
-                    Ok(DataItem::File(f)) => self.insert_file(&uri_to_path(&f.to_data_uri()),
-                                                              Timespec::new(f.last_modified.timestamp(), 0),
-                                                              f.size),
-                    Err(err) => {
-                        // TODO: should return Err(...)?
-                        println!("Error listing directory: {}", err);
-                        0
-                    }
-                }
-            })
-            .filter(|ino| *ino != 0)
-            .collect::<Vec<_>>();
+                 uri);
 
         {
             // Mark this node visited
-            let dir_prefix = path_to_prefix(&self.paths[(ino-1) as usize]);
-            let mut dir_node = self.fs_trie.get_mut(&dir_prefix).expect("node missing for dir just listed");
-            dir_node.visited = true;
+            let ref mut inodes = self.inodes;
+            let mut dir_inode = inodes.get_mut(ino).expect("inode missing for dir just listed");
+            dir_inode.visited = true;
         }
 
-        Ok(inos.iter().map(|ino| self.inodes[(ino - 1) as usize].clone()).collect())
+        for (i, entry_result) in self.client.dir(&uri).list().enumerate() {
+            let child = match entry_result {
+                Ok(DataItem::Dir(d)) => {
+                    let path = uri_to_path(&d.to_data_uri());
+                    self.insert_dir(&path, DEFAULT_TIME, 0o750)
+                }
+                Ok(DataItem::File(f)) => {
+                    let path = uri_to_path(&f.to_data_uri());
+                    let mtime = Timespec::new(f.last_modified.timestamp(), 0);
+                    self.insert_file(&path, mtime, f.size)
+                }
+                Err(err) => {
+                    println!("Error listing directory: {}", err);
+                    return reply.error(ENOENT);
+                }
+            };
+            reply.add(child.attr.ino,
+                i as u64 + offset + 2,
+                child.attr.kind,
+                get_basename(&child.path));
+        }
+        reply.ok()
     }
 
     // TODO: support a page/offset type of arg?
-    fn algo_lookup(&mut self, path: &str) -> Result<FileAttr, String> {
+    fn algo_lookup(&mut self, path: &str) -> Result<&Inode, String> {
         let uri = path_to_uri(&path);
         println!("algo_lookup: {}", uri);
         match self.client.data(&uri).into_type() {
             Ok(DataItem::Dir(_)) => {
-                let inserted_ino = self.insert_dir(&path, DEFAULT_TIME, 0o750); // TODO: API should indicate not listable
-                Ok(self.inodes[(inserted_ino - 1) as usize])
+                // TODO: API should indicate not listable
+                Ok(self.insert_dir(&path, DEFAULT_TIME, 0o750))
             }
             Ok(DataItem::File(f)) => {
-                let inserted_ino = self.insert_file(&path,
-                                    Timespec::new(f.last_modified.timestamp(), 0),
-                                    f.size);
-                Ok(self.inodes[(inserted_ino - 1) as usize])
+                Ok(self.insert_file(&path, Timespec::new(f.last_modified.timestamp(), 0), f.size))
             }
             Err(err) => Err(err.to_string()),
         }
@@ -207,11 +158,12 @@ impl AlgoFs {
         }
     }
 
+    fn insert_dir(&mut self, path: &str, mtime: Timespec, perm: u16) -> &Inode {
+        let ref mut inodes = self.inodes;
+        let ino = inodes.len() as u64 + 1;
+        println!("insert_dir: {} {}", ino, path);
 
-    fn insert_dir(&mut self, path: &str, mtime: Timespec, perm: u16) -> u64 {
-        let ino = self.inodes.len() as u64 + 1;
-
-        self.inodes.push(FileAttr {
+        let attr = FileAttr {
             ino: ino,
             size: 0,
             blocks: 0,
@@ -226,17 +178,17 @@ impl AlgoFs {
             gid: self.gid,
             rdev: 0,
             flags: 0,
-        });
-        self.paths.push(path.to_string());
-        println!("insert_dir: {} {}", ino, path);
-
-        self.fs_trie.insert(&path_to_prefix(path), TrieNode::new(ino));
-        ino
+        };
+        inodes.insert(Inode::new(path, attr));
+        inodes.get(ino).unwrap()
     }
 
-    fn insert_file(&mut self, path: &str, mtime: Timespec, size: u64) -> u64 {
-        let ino = self.inodes.len() as u64 + 1;
-        self.inodes.push(FileAttr {
+    fn insert_file(&mut self, path: &str, mtime: Timespec, size: u64) -> &Inode {
+        let ref mut inodes = self.inodes;
+        let ino = inodes.len() as u64 + 1;
+        println!("insert_file: {} {}", ino, path);
+
+        let attr = FileAttr {
             ino: ino,
             size: size,
             blocks: (size / 512) + 1, // TODO: const BLOCKSIZE
@@ -251,11 +203,9 @@ impl AlgoFs {
             gid: self.gid,
             rdev: 0,
             flags: 0,
-        });
-
-        self.paths.push(path.to_string());
-        self.fs_trie.insert(&path_to_prefix(path), TrieNode::new(ino));
-        ino
+        };
+        inodes.insert(Inode::new(path, attr));
+        inodes.get(ino).unwrap()
     }
 }
 
@@ -264,54 +214,41 @@ impl Filesystem for AlgoFs {
         let name = name.to_string_lossy();
         println!("lookup: {}/{}", parent, name);
         match (parent, name.as_ref()) {
-            (1, "") => reply.entry(&TTL, &self.inodes[0], 0),
-            (1, "data") => reply.entry(&TTL, &self.inodes[1], 0),
+            (1, "") => reply.entry(&DEFAULT_TTL, &self.inodes[1].attr, 0),
+            (1, "data") => reply.entry(&DEFAULT_TTL, &self.inodes[2].attr, 0),
             (1, connector) if !connector.starts_with("dropbox") && !connector.starts_with("s3") => {
                 // Filesystems look for a bunch of junk in the rootdir by default, so lets whitelist supported connector prefixes
                 reply.error(ENOENT);
             }
             _ => {
-                let child_path = {
-                    let ref parent_path = self.paths[(parent - 1) as usize];
-                    format!("{}/{}", parent_path, name)
-                };
-                let child_segment = path_to_prefix(&child_path);
-
-                // Check child. If not in cache, check if parent has been traversed to decide if we should actually make API call
-                let child_ino = match self.fs_trie.get(&child_segment) {
-                    Some(child_node) => Some(child_node.ino),
-                    None => match self.fs_trie.get_ancestor(&child_segment) {
-                        // TODO: not sure I want inode 0 to be an error case, but gets around non-lexical lifetimes for now
-                        Some(parent_node) if parent_node.visited && parent_node.ino != 1 => Some(0),
-                        _ => None,
-                    }
-                };
-
-                // Awkward flow: MIR with non-lexical lifetimes can't arrive soon enough
-                match child_ino {
-                    Some(0) => {
-                        println!("lookup - short-circuiting cache miss");
-                        reply.error(ENOENT);
-                    }
-                    Some(child_ino) => reply.entry(&TTL, &self.inodes[(child_ino - 1) as usize], 0),
+                // Clone until MIR NLL lands
+                match self.inodes.child(parent, &name).cloned() {
+                    Some(child_inode) => reply.entry(&DEFAULT_TTL, &child_inode.attr, 0),
                     None => {
-                        match self.algo_lookup(&child_path) {
-                            Ok(attr) => reply.entry(&TTL, &attr, 0),
-                            Err(err) => {
-                                println!("lookup error - {}", err);
-                                reply.error(ENOENT);
+                        // Clone until MIR NLL lands
+                        let parent_inode = self.inodes[parent].clone();
+                        if parent_inode.visited {
+                            println!("lookup - short-circuiting cache miss");
+                            reply.error(ENOENT);
+                        } else {
+                            let child_path = format!("{}/{}", parent_inode.path, name);
+                            match self.algo_lookup(&child_path) {
+                                Ok(child_inode) => reply.entry(&DEFAULT_TTL, &child_inode.attr, 0),
+                                Err(err) => {
+                                    println!("lookup error - {}", err);
+                                    reply.error(ENOENT);
+                                }
                             }
                         }
                     }
                 }
             }
-
         };
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        match self.inodes.get((ino - 1) as usize) {
-            Some(attr) => reply.attr(&TTL, attr),
+        match self.inodes.get(ino) {
+            Some(inode) => reply.attr(&DEFAULT_TTL, &inode.attr),
             None => {
                 println!("getattr ENOENT: {}", ino);
                 reply.error(ENOENT);
@@ -324,7 +261,8 @@ impl Filesystem for AlgoFs {
         println!("read {}[{}..+{}]", ino, offset, size);
 
         if offset == 0 || !self.cache.contains_key(&ino) {
-            let path = self.paths[(ino - 1) as usize].clone();
+            // Clone until MIR NLL
+            let path = self.inodes[ino].path.clone();
             let response = self.algo_read(&path);
             match response {
                 Ok(buffer) => self.cache.insert(ino, buffer),
@@ -377,47 +315,18 @@ impl Filesystem for AlgoFs {
                 reply.ok();
             }
             (1, _) => reply.ok(),
-            _ => match self.inodes.len() >= (ino as usize) {
-                true => {
-                    let dir_prefix = path_to_prefix(&self.paths[(ino-1) as usize]);
-                    let dir_visited  = self.fs_trie.get(&dir_prefix).map(|n| n.visited).unwrap_or(false);
-                    let children_res  = match dir_visited {
-                        true => self.cache_listdir(ino, offset),
-                        false => self.algo_listdir(ino, offset),
-                    };
-
-                    let parent_ino = self.fs_trie.get_ancestor(&dir_prefix)
-                                         .expect("TODO: insert parent inode if not previously known")
-                                         .ino
-                                         .clone();
-
-                    match children_res {
-                        Ok(children) => {
-                            if offset == 0 {
-                                reply.add(ino, 0, FileType::Directory, ".");
-                                reply.add(parent_ino, 1, FileType::Directory, "..");
-                            }
-
-                            for (i, child_attr) in children.iter().enumerate() {
-                                let ref child_path = self.paths[(child_attr.ino - 1) as usize];
-                                reply.add(child_attr.ino,
-                                          (i + 2) as u64,
-                                          child_attr.kind,
-                                          get_basename(child_path));
-                            }
-                            reply.ok();
-                        }
-                        Err(err) => {
-                            println!("readdir error: {}", err);
-                            reply.error(ENOENT);
-                        }
-                    }
-
+            _ => {
+                if offset == 0 {
+                    let parent = self.inodes.parent(ino).expect("inode has no parent");
+                    reply.add(ino, 0, FileType::Directory, ".");
+                    reply.add(parent.attr.ino, 1, FileType::Directory, "..");
                 }
-                false => {
-                    println!("inode not found: {}", ino);
-                    reply.error(ENOENT);
-                }
+
+                let dir_visited  = self.inodes.get(ino).map(|n| n.visited).unwrap_or(false);
+                match dir_visited {
+                    true => self.cache_listdir(ino, offset, reply),
+                    false => self.algo_listdir(ino, offset, reply),
+                };
             },
         }
     }
@@ -447,10 +356,6 @@ pub fn uri_to_path(uri: &str) -> String {
     }
 }
 
-
-pub fn path_to_prefix(path: &str) -> Vec<String> {
-    path.split_terminator("/").map(String::from).collect()
-}
 
 fn get_basename(path: &str) -> String {
     path.rsplitn(2, "/").next().unwrap().to_string()
