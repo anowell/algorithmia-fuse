@@ -27,37 +27,37 @@ impl Inode {
 }
 
 pub struct InodeStore {
-    ino_map: HashMap<u64, Rc<RefCell<Inode>>>,
-    ino_trie: SequenceTrie<String, Rc<RefCell<Inode>>>,
+    inode_map: HashMap<u64, Inode>,
+    ino_trie: SequenceTrie<String, u64>,
 }
 
 impl InodeStore {
     pub fn new() -> InodeStore {
         InodeStore {
-            ino_map: HashMap::new(),
+            inode_map: HashMap::new(),
             ino_trie: SequenceTrie::new(),
         }
     }
 
-    pub fn get(&self, ino: u64) -> Option<Ref<Inode>> {
-        self.ino_map.get(&ino).map(|inode| inode.borrow())
+    pub fn get(&self, ino: u64) -> Option<&Inode> {
+        self.inode_map.get(&ino)
     }
 
-    pub fn get_by_path(&self, path: &str) -> Option<Ref<Inode>> {
+    pub fn get_by_path(&self, path: &str) -> Option<&Inode> {
         let sequence = path_to_sequence(path);
-        self.ino_trie.get(&sequence).map(|inode| inode.borrow())
+        self.ino_trie.get(&sequence).and_then(|ino| self.get(*ino))
     }
 
-    pub fn child(&self, ino: u64, name: &str) -> Option<Ref<Inode>> {
+    pub fn child(&self, ino: u64, name: &str) -> Option<&Inode> {
         self.get(ino)
             .and_then(|inode| {
                 let mut sequence = path_to_sequence(&inode.path);
                 sequence.push(name.into());
-                self.ino_trie.get(&sequence).map(|p| p.borrow())
+                self.ino_trie.get(&sequence).and_then(|ino| self.get(*ino) )
             })
     }
 
-    pub fn children(&self, ino: u64) -> Vec<Ref<Inode>> {
+    pub fn children(&self, ino: u64) -> Vec<&Inode> {
         match self.get(ino) {
             Some(inode) => {
                 let sequence = path_to_sequence(&inode.path);
@@ -66,31 +66,32 @@ impl InodeStore {
                 node.children
                     .values()
                     .filter_map(|ref c| c.value.as_ref() )
-                    .map(|c| c.borrow() )
+                    .map(|ino| self.get(*ino).expect("inconsistent fs - found child without inode") )
                     .collect()
             }
             None => vec![],
         }
     }
 
-    pub fn parent(&self, ino: u64) -> Option<Ref<Inode>> {
+    pub fn parent(&self, ino: u64) -> Option<&Inode> {
         self.get(ino)
             .and_then(|inode| {
                 let sequence = path_to_sequence(&inode.path);
                 match sequence.len() {
                     0 | 1 => None,
-                    len => self.ino_trie.get(&sequence[0..(len-1)]).map(|p| p.borrow())
+                    len => self.ino_trie.get(&sequence[0..(len-1)]).and_then(|p_ino| self.get(*p_ino) )
                 }
             })
     }
 
-    pub fn get_mut(&mut self, ino: u64) -> Option<RefMut<Inode>> {
-        self.ino_map.get(&ino).map(|inode| inode.borrow_mut())
+    pub fn get_mut(&mut self, ino: u64) -> Option<&mut Inode> {
+        self.inode_map.get_mut(&ino)
     }
 
-    pub fn get_mut_by_path(&mut self, path: &str) -> Option<RefMut<Inode>> {
+    pub fn get_mut_by_path(&mut self, path: &str) -> Option<&mut Inode> {
         let sequence = path_to_sequence(path);
-        self.ino_trie.get(&sequence).map(|inode| inode.borrow_mut())
+        self.ino_trie.get(&sequence).cloned()
+            .and_then(move |ino| self.get_mut(ino))
     }
 
     // pub fn get_mut_parent(&mut self, ino: u64) -> &mut Inode {
@@ -104,10 +105,10 @@ impl InodeStore {
     pub fn insert(&mut self, inode: Inode) {
         let ino = inode.attr.ino;
         let sequence = path_to_sequence(&inode.path);
-        let boxed_inode = Rc::new(RefCell::new(inode));
+
         // TODO: verify that either both insert or both update
-        let _ = self.ino_map.insert(ino, boxed_inode.clone());
-        let _ = self.ino_trie.insert(&sequence, boxed_inode);
+        let _ = self.inode_map.insert(ino, inode);
+        let _ = self.ino_trie.insert(&sequence, ino);
     }
 }
 
