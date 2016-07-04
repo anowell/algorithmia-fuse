@@ -11,7 +11,6 @@ use algorithmia::data::*;
 use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
 use libc::ENOENT;
 use std::collections::HashMap;
-use std::env;
 use std::io::Read;
 use std::path::Path;
 use time::Timespec;
@@ -20,6 +19,24 @@ use inode::{Inode, InodeStore};
 // 2015-03-12 00:00 PST Algorithmia Launch
 pub const DEFAULT_TIME: Timespec = Timespec { sec: 1426147200, nsec: 0 };
 pub const DEFAULT_TTL: Timespec = Timespec { sec: 1, nsec: 0 };
+
+pub struct MountOptions<'a> {
+    path: &'a Path,
+    uid: u32,
+    gid: u32,
+    // read_only: bool,
+}
+
+impl <'a> MountOptions<'a> {
+    pub fn new<P: AsRef<Path>>(path: &P) -> MountOptions {
+        MountOptions {
+            path: path.as_ref(),
+            uid: unsafe { libc::getuid() } as u32,
+            gid: unsafe { libc::getgid() } as u32,
+            // read_only: false,
+        }
+    }
+}
 
 pub struct AlgoFs {
     inodes: InodeStore,
@@ -31,15 +48,7 @@ pub struct AlgoFs {
 }
 
 impl AlgoFs {
-    pub fn mount<P: AsRef<Path>>(path: &P) {
-        // TODO: allow setting uid/gid for FS
-        let api_key = env::var("ALGORITHMIA_API_KEY").expect("Must set ALGORITHMIA_API_KEY");
-        let api_base = env::var("ALGORITHMIA_API").expect("Must set ALGORITHMIA_API");
-        let api_base_url = Url::parse(&api_base).expect("Failed to parse ALGORITHMIA_API as a URL");
-        let client = Algorithmia::alt_client(api_base_url, &*api_key);
-        let uid = unsafe { libc::getuid() } as u32;
-        let gid = unsafe { libc::getgid() } as u32;
-
+    pub fn mount(options: MountOptions, client: Algorithmia) {
         let data_root = FileAttr {
             ino: 2,
             size: 0,
@@ -51,23 +60,23 @@ impl AlgoFs {
             kind: FileType::Directory,
             perm: 0o550,
             nlink: 2,
-            uid: uid,
-            gid: gid,
+            uid: options.uid,
+            gid: options.gid,
             rdev: 0,
             flags: 0,
         };
 
-        let mut inodes = InodeStore::new(0o550, uid, gid);
+        let mut inodes = InodeStore::new(0o550, options.uid, options.gid);
         inodes.insert(Inode::new("data", data_root));
 
         let adfs = AlgoFs {
             client: client,
             inodes: inodes,
             cache: HashMap::new(),
-            uid: uid,
-            gid: gid,
+            uid: options.uid,
+            gid: options.gid,
         };
-        fuse::mount(adfs, path, &[]);
+        fuse::mount(adfs, &options.path, &[]);
     }
 
     fn cache_listdir<'a>(&'a self, ino: u64, offset: u64, mut reply: ReplyDirectory) {
