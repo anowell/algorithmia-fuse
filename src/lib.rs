@@ -8,8 +8,8 @@ mod inode;
 
 use algorithmia::*;
 use algorithmia::data::*;
-use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
-use libc::ENOENT;
+use fuse::*;
+use libc::{ENOENT, EIO, EROFS, ENOSYS};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
@@ -221,7 +221,7 @@ impl AlgoFs {
 impl Filesystem for AlgoFs {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEntry) {
         let name = name.to_string_lossy();
-        println!("lookup: {}/{}", parent, name);
+        println!("lookup(parent={}, name=\"{}\")", parent, name);
         match (parent, name.as_ref()) {
             (1, "") => reply.entry(&DEFAULT_TTL, &self.inodes[1].attr, 0),
             (1, "data") => reply.entry(&DEFAULT_TTL, &self.inodes[2].attr, 0),
@@ -267,7 +267,7 @@ impl Filesystem for AlgoFs {
 
     // TODO: don't buffer the whole thing. Just store the DataResponse and read size at a time as long as offsets line up
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, size: u32, reply: ReplyData) {
-        println!("read {}[{}..+{}]", ino, offset, size);
+        println!("read(ino={}, fh={}, offset={}, size={})", ino, _fh, offset, size);
 
         if offset == 0 || !self.cache.contains_key(&ino) {
             // Clone until MIR NLL
@@ -277,7 +277,7 @@ impl Filesystem for AlgoFs {
                 Ok(buffer) => self.cache.insert(ino, buffer),
                 Err(err) => {
                     println!("read error: {}", err);
-                    reply.error(ENOENT);
+                    reply.error(EIO);
                     return
                 }
             };
@@ -337,6 +337,91 @@ impl Filesystem for AlgoFs {
                     false => self.algo_listdir(ino, offset, reply),
                 };
             },
+        }
+    }
+
+    fn open (&mut self, _req: &Request, ino: u64, flags: u32, reply: ReplyOpen) {
+        println!("open(ino={}, flags=0x{:x})", ino, flags);
+        // match flags & O_ACCMODE => O_RDONLY, O_WRONLY, O_RDWR
+        // flags & O_CREAT => create if not exist
+        //
+
+        reply.opened(0, 0);
+    }
+
+    fn write (&mut self, _req: &Request, ino: u64, fh: u64, offset: u64, data: &[u8], flags: u32, reply: ReplyWrite) {
+        // TODO: check if in read-only mode: EROFS
+        println!("write(ino={}, fh={}, offset={}, flags=0x{:x})", ino, fh, offset, flags);
+
+        // if offset==0 && data.len() >= inode.attr.size {
+        //    TODO: skip data cache lookup
+        // }
+        if !self.cache.contains_key(&ino) {
+            // Clone until MIR NLL
+            let path = self.inodes[ino].path.clone();
+
+            // TODO: check if file exists
+            let response = self.algo_read(&path);
+            match response {
+                Ok(buffer) => self.cache.insert(ino, buffer),
+                Err(err) => {
+                    println!("read error: {}", err);
+                    reply.error(EIO);
+                    return
+                }
+            };
+        }
+
+        let new_size = match self.cache.get_mut(&ino) {
+            Some(ref mut cache_line) => {
+                let end = data.len() + offset as usize;
+                if end > self.inodes[ino].attr.size as usize {
+                    cache_line.resize(end, 0);
+                }
+                cache_line[(offset as usize)..end].copy_from_slice(data);
+                println!("update cache for ino={} for range {}..{}", ino, offset, end);
+                reply.written(data.len() as u32);
+                cache_line.len() as u64
+            }
+            None => {
+                println!("write failed to read file");
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        let ref mut inode = self.inodes[ino];
+        inode.attr.size = new_size;
+    }
+
+    fn fsync (&mut self, _req: &Request, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+        println!("fsync(ino={}, fh={}, datasync={})", ino, fh, datasync);
+        reply.error(ENOSYS);
+    }
+
+    /// Remove a file
+    fn unlink (&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEmpty) {
+        println!("unlink(parent={}, name=\"{}\")", parent, name.to_string_lossy());
+        reply.error(ENOSYS);
+    }
+
+    fn setattr (&mut self, _req: &Request, ino: u64, _mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, _atime: Option<Timespec>, _mtime: Option<Timespec>, _fh: Option<u64>, _crtime: Option<Timespec>, _chgtime: Option<Timespec>, _bkuptime: Option<Timespec>, flags:               Option<u32>, reply: ReplyAttr) {
+        println!("setattr(ino={}, mode={:?}, size={:?}, fh={:?}, flags={:?})", ino, _mode, size, _fh, flags);
+        match self.inodes.get_mut(ino) {
+            Some(mut inode) => {
+                if let Some(new_size) = size {
+                    inode.attr.size = new_size;
+                }
+                if let Some(new_uid) = uid {
+                    inode.attr.uid = new_uid;
+                }
+                if let Some(new_gid) = gid {
+                    inode.attr.gid = new_gid;
+                }
+                // TODO: is mode (u32) equivalent to attr.perm (u16)?
+                reply.attr(&DEFAULT_TTL, &inode.attr);
+            }
+            None => reply.error(ENOENT)
         }
     }
 }
