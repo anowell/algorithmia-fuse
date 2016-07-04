@@ -200,7 +200,7 @@ impl AlgoFs {
         let attr = FileAttr {
             ino: ino,
             size: size,
-            blocks: (size / 512) + 1, // TODO: const BLOCKSIZE
+            blocks: 0,
             atime: mtime,
             mtime: mtime,
             ctime: mtime,
