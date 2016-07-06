@@ -5,6 +5,7 @@ extern crate time;
 extern crate sequence_trie;
 
 mod inode;
+mod cache;
 
 use algorithmia::*;
 use algorithmia::data::*;
@@ -15,6 +16,7 @@ use std::io::Read;
 use std::path::Path;
 use time::Timespec;
 use inode::{Inode, InodeStore};
+use cache::CacheEntry;
 
 // 2015-03-12 00:00 PST Algorithmia Launch
 pub const DEFAULT_TIME: Timespec = Timespec { sec: 1426147200, nsec: 0 };
@@ -41,7 +43,7 @@ impl <'a> MountOptions<'a> {
 pub struct AlgoFs {
     inodes: InodeStore,
     /// map of inodes to to data buffers - indexed by inode (NOT inode-1)
-    cache: HashMap<u64, Vec<u8>>,
+    cache: HashMap<u64, CacheEntry>,
     client: Algorithmia,
     uid: u32,
     gid: u32,
@@ -265,16 +267,21 @@ impl Filesystem for AlgoFs {
         };
     }
 
-    // TODO: don't buffer the whole thing. Just store the DataResponse and read size at a time as long as offsets line up
+
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, size: u32, reply: ReplyData) {
         println!("read(ino={}, fh={}, offset={}, size={})", ino, _fh, offset, size);
 
-        if offset == 0 || !self.cache.contains_key(&ino) {
+        // Determine if we should hit the API
+        if !self.cache.get(&ino).unwrap().warm {
             // Clone until MIR NLL
             let path = self.inodes[ino].path.clone();
             let response = self.algo_read(&path);
             match response {
-                Ok(buffer) => self.cache.insert(ino, buffer),
+                Ok(buffer) => {
+                    let mut entry = self.cache.get_mut(&ino).unwrap();
+                    entry.set(buffer);
+                    entry.sync = true;
+                },
                 Err(err) => {
                     println!("read error: {}", err);
                     reply.error(EIO);
@@ -283,30 +290,20 @@ impl Filesystem for AlgoFs {
             };
         }
 
-        let reset_cache = {
-            let buffer = self.cache.get(&ino).unwrap();
-
-            let end_offset = offset + size as u64;
-            match buffer.len() {
-                len if len as u64 > offset + size as u64 => {
-                    reply.data(&buffer[(offset as usize)..(end_offset as usize)]);
-                    false
-                }
-                len if len as u64 > offset => {
-                    reply.data(&buffer[(offset as usize)..]);
-                    true
-                }
-                len => {
-                    println!("attempted read beyond buffer for ino {} len={} offset={} size={}", ino, len, offset, size);
-                    reply.error(ENOENT);
-                    true
-                }
+        // Return the cached data
+        let ref buffer = self.cache.get(&ino).unwrap().data;
+        let end_offset = offset + size as u64;
+        match buffer.len() {
+            len if len as u64 > offset + size as u64 => {
+                reply.data(&buffer[(offset as usize)..(end_offset as usize)]);
             }
-        };
-
-        if reset_cache {
-            // FIXME: data race if 2 processes were reading the same file.
-            let _ = self.cache.remove(&ino);
+            len if len as u64 > offset => {
+                reply.data(&buffer[(offset as usize)..]);
+            }
+            len => {
+                println!("attempted read beyond buffer for ino {} len={} offset={} size={}", ino, len, offset, size);
+                reply.error(ENOENT);
+            }
         }
     }
 
@@ -343,27 +340,53 @@ impl Filesystem for AlgoFs {
     fn open (&mut self, _req: &Request, ino: u64, flags: u32, reply: ReplyOpen) {
         println!("open(ino={}, flags=0x{:x})", ino, flags);
         // match flags & O_ACCMODE => O_RDONLY, O_WRONLY, O_RDWR
-        // flags & O_CREAT => create if not exist
-        //
 
+        let mut entry = self.cache.entry(ino).or_insert_with(|| CacheEntry::new());
+        entry.opened();
         reply.opened(0, 0);
+    }
+
+    fn release (&mut self, _req: &Request, ino: u64, fh: u64, flags: u32, _lock_owner: u64, flush: bool, reply: ReplyEmpty) {
+        println!("release(ino={}, fh={}, flags=0x{:x}, flush={})", ino, fh, flags, flush);
+
+        // TODO: handle flush==true
+
+        let remove_cache_entry = match self.cache.get_mut(&ino) {
+            Some(mut entry) => {
+                let handles = entry.released();
+                handles == 0 && entry.sync
+            }
+            None => false
+        };
+
+        if remove_cache_entry {
+            println!("release is purching {} from cache", ino);
+            let _ = self.cache.remove(&ino);
+        }
+
+        reply.ok();
     }
 
     fn write (&mut self, _req: &Request, ino: u64, fh: u64, offset: u64, data: &[u8], flags: u32, reply: ReplyWrite) {
         // TODO: check if in read-only mode: EROFS
-        println!("write(ino={}, fh={}, offset={}, flags=0x{:x})", ino, fh, offset, flags);
+        println!("write(ino={}, fh={}, offset={}, len={}, flags=0x{:x})", ino, fh, offset, data.len(), flags);
 
-        // if offset==0 && data.len() >= inode.attr.size {
-        //    TODO: skip data cache lookup
-        // }
-        if !self.cache.contains_key(&ino) {
+
+        let is_replace = (offset == 0) && (self.inodes.get(ino).unwrap().attr.size < data.len() as u64);
+
+        // Skip data lookup if write entirely replaces file or if we already cached the API response.
+        if !is_replace && !self.cache.get(&ino).unwrap().warm {
             // Clone until MIR NLL
             let path = self.inodes[ino].path.clone();
 
             // TODO: check if file exists
             let response = self.algo_read(&path);
             match response {
-                Ok(buffer) => self.cache.insert(ino, buffer),
+                Ok(buffer) => {
+                    let mut entry = self.cache.get_mut(&ino).unwrap();
+                    entry.set(buffer);
+                    entry.sync = true;
+                },
                 Err(err) => {
                     println!("read error: {}", err);
                     reply.error(EIO);
@@ -373,15 +396,14 @@ impl Filesystem for AlgoFs {
         }
 
         let new_size = match self.cache.get_mut(&ino) {
-            Some(ref mut cache_line) => {
+            Some(ref mut entry) => {
                 let end = data.len() + offset as usize;
                 if end > self.inodes[ino].attr.size as usize {
-                    cache_line.resize(end, 0);
+                    entry.data.resize(end, 0);
                 }
-                cache_line[(offset as usize)..end].copy_from_slice(data);
-                println!("update cache for ino={} for range {}..{}", ino, offset, end);
+                entry.write(offset, &data);
                 reply.written(data.len() as u32);
-                cache_line.len() as u64
+                entry.data.len() as u64
             }
             None => {
                 println!("write failed to read file");

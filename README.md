@@ -19,9 +19,9 @@ Screenshots demonstrate basic traversal and read operations from CLI and file ex
   - [ ] Deleting files and dirs (i.e. impl `rmdir`, `unlink`, and probably `forget`)
   - [ ] Making directories (i.e. impl `mkdir`)
 - [ ] Production Filesystem
-  - [ ] All the hard problems like sane caching, multi-process data races, large files, large directories, inode limits, optimizing
+  - [ ] All the hard problems like sane caching, multi-process data races, large files, large directories, inode limits, optimizing, better timestamp consistency
 
-dea: Experiment with representing algorithms as `FileType::NamedPipe` under `<mountpoint>/algorithms/<username>/<algoname>/<version>` so you can have one handle that pipes data to an algorithm and another handle that receives responses. (e.g. `echo 'Are you pondering?' > ~/algofs/algorithms/anowell/Pinky/latest`)
+Idea: Experiment with representing algorithms as `FileType::NamedPipe` under `<mountpoint>/algorithms/<username>/<algoname>/<version>` so you can have one handle that pipes data to an algorithm and another handle that receives responses. (e.g. `echo 'Are you pondering?' > ~/algofs/algorithms/anowell/Pinky/latest`)
 
 ## Build, Test, Run, Debug
 
@@ -37,13 +37,13 @@ $ mkdir ~/algofs
 $ target/debug/algofs ~/algofs
 ```
 
-The `algofs` executable will print all the current debug output, 
+The `algofs` executable will print all the current debug output,
 so currently it works best to browse the `~/algofs` from another terminal.
 
 Note: some shell enhancements can cause a lot of extra listing operations.
 And file explorers may trigger a lot of extra reads to preload or preview files.
 
-To stop algofs, unmount it as root. (Note: killing `algofs` will stop request handling, but leaves `~/algofs` as a volume with no transport connected). 
+To stop algofs, unmount it as root. (Note: killing `algofs` will stop request handling, but leaves `~/algofs` as a volume with no transport connected).
 ```
 fusermount -u ~/algofs
 # or `sudo umount ~/algofs`
