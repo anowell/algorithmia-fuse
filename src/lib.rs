@@ -156,7 +156,7 @@ impl AlgoFs {
     }
 
     // TODO: support a page/offset type of arg?
-    fn algo_read(&mut self, path: &str) -> Result<Vec<u8>, String> {
+    fn algo_read(&self, path: &str) -> Result<Vec<u8>, String> {
         let uri = path_to_uri(&path);
         println!("algo_read: {}", uri);
         match self.client.file(&uri).get() {
@@ -167,6 +167,42 @@ impl AlgoFs {
             }
             Err(err) => Err(err.to_string()),
         }
+    }
+
+    fn algo_write(&self, path: &str, data: &[u8]) -> Result<(), String> {
+        let uri = path_to_uri(&path);
+        println!("algo_write: {} ({} bytes)", uri, data.len());
+        match self.client.file(&uri).put(data) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+
+    fn flush_cache_if_needed(&mut self, ino: u64) -> Result<bool, String> {
+        let flushed = {
+            let entry = self.cache.get(&ino).unwrap();
+
+            match entry.warm && !entry.sync {
+                true => {
+                    let ref path = self.inodes[ino].path;
+                    match self.algo_write(&path, &entry.data) {
+                        Ok(_) => true,
+                        Err(err) => {
+                            println!("fsync error - {}", err);
+                            return Err(err);
+                        }
+                    }
+                }
+                false => false
+            }
+        };
+
+        if flushed {
+            self.cache.get_mut(&ino).unwrap().sync = true;
+        }
+
+        Ok(flushed)
     }
 
     fn insert_dir(&mut self, path: &str, mtime: Timespec, perm: u16) -> &Inode {
@@ -349,18 +385,17 @@ impl Filesystem for AlgoFs {
     fn release (&mut self, _req: &Request, ino: u64, fh: u64, flags: u32, _lock_owner: u64, flush: bool, reply: ReplyEmpty) {
         println!("release(ino={}, fh={}, flags=0x{:x}, flush={})", ino, fh, flags, flush);
 
-        // TODO: handle flush==true
+        let handles = self.cache.get_mut(&ino).unwrap().released();
 
-        let remove_cache_entry = match self.cache.get_mut(&ino) {
-            Some(mut entry) => {
-                let handles = entry.released();
-                handles == 0 && entry.sync
+        // Until I really get fsync stuff working, also write-on-close
+        if handles == 0 {
+            if let Err(err) = self.flush_cache_if_needed(ino) {
+                println!("release flush error - {}", err);
             }
-            None => false
-        };
+        }
 
-        if remove_cache_entry {
-            println!("release is purching {} from cache", ino);
+        if handles == 0 && self.cache.get(&ino).unwrap().sync {
+            println!("release is purging {} from cache", ino);
             let _ = self.cache.remove(&ino);
         }
 
@@ -418,7 +453,14 @@ impl Filesystem for AlgoFs {
 
     fn fsync (&mut self, _req: &Request, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
         println!("fsync(ino={}, fh={}, datasync={})", ino, fh, datasync);
-        reply.error(ENOSYS);
+
+        match self.flush_cache_if_needed(ino) {
+            Ok(_) => reply.ok(),
+            Err(err) => {
+                println!("fsync error - {}", err);
+                reply.error(EIO);
+            }
+        }
     }
 
     /// Remove a file
