@@ -15,7 +15,7 @@ Screenshots demonstrate basic traversal and read operations from CLI and file ex
   - [x] Connector support (very limited, blocked by API - see [Issue #1](../../issues/1))
   - [x] Basic file reading (read cache caveats: see [Issue #2](../../isues/2))
 - [ ] Writeable Filesystem
-  - [ ] Writing files (i.e. impl `write`, `mknod` - probably `fsync` but need to experiment to better understand `flush`)
+  - [x] Writing files (i.e. impl `write`, `mknod` - probably `fsync` but need to experiment to better understand `flush`)
   - [ ] Deleting files and dirs (i.e. impl `rmdir`, `unlink`, and probably `forget`)
   - [ ] Making directories (i.e. impl `mkdir`)
 - [ ] Production Filesystem
