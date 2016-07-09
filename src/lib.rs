@@ -467,7 +467,8 @@ impl Filesystem for AlgoFs {
             }
         }
 
-        if handles == 0 && self.cache.get(&ino).unwrap().sync {
+        let &CacheEntry {sync, warm, ..} = self.cache.get(&ino).unwrap();
+        if handles == 0 && (sync || !warm) {
             println!("release is purging {} from cache", ino);
             let _ = self.cache.remove(&ino);
         }
