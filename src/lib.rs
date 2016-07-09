@@ -157,7 +157,6 @@ impl AlgoFs {
         }
     }
 
-    // TODO: support a page/offset type of arg?
     fn algo_read(&self, path: &str) -> Result<Vec<u8>, String> {
         let uri = path_to_uri(&path);
         println!("algo_read: {}", uri);
@@ -167,6 +166,17 @@ impl AlgoFs {
                 let _ = response.read_to_end(&mut buffer);
                 Ok(buffer)
             }
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    // Note: since delete dir and delete file are fundamentally the same request
+    //   we'll treat both as a file delete (no need for force flag, since FUSE has no such concept)
+    fn algo_delete(&self, path: &str) -> Result<(), String> {
+        let uri = path_to_uri(&path);
+        println!("algo_delete: {}", uri);
+        match self.client.file(&uri).delete() {
+            Ok(_) => Ok(()),
             Err(err) => Err(err.to_string()),
         }
     }
@@ -430,6 +440,58 @@ impl Filesystem for AlgoFs {
         reply.ok();
     }
 
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEmpty) {
+        let name = name.to_string_lossy();
+        println!("unlink(parent={}, name={})", parent, name);
+
+        if parent == 1 {
+            println!("User tried deleting a file in fs root - explicitly unsupported.");
+            return reply.error(EACCES);
+        }
+
+        let ino_opt = self.inodes.child(parent, &name).map(|inode| inode.attr.ino);
+        let path = format!("{}/{}", self.inodes[parent].path, name);
+        match self.algo_delete(&path) {
+            Ok(_) => {
+                ino_opt.map(|ino| {
+                    self.inodes.remove(ino);
+                    self.cache.remove(&ino);
+                });
+                reply.ok()
+            },
+            Err(err) => {
+                println!("Delete failed: {}", err);
+                reply.error(EIO);
+            }
+        }
+    }
+
+    fn rmdir(&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEmpty) {
+        let name = name.to_string_lossy();
+        println!("rmdir(parent={}, name={})", parent, name);
+
+        if parent == 1 {
+            println!("User tried deleting a dir in fs root - explicitly unsupported.");
+            return reply.error(EACCES);
+        }
+
+        let ino_opt = self.inodes.child(parent, &name).map(|inode| inode.attr.ino);
+        let path = format!("{}/{}", self.inodes[parent].path, name);
+        match self.algo_delete(&path) {
+            Ok(_) => {
+                ino_opt.map(|ino| {
+                    self.inodes.remove(ino);
+                    self.cache.remove(&ino);
+                });
+                reply.ok()
+            },
+            Err(err) => {
+                println!("Delete failed: {}", err);
+                reply.error(EIO);
+            }
+        }
+    }
+
     fn write (&mut self, _req: &Request, ino: u64, fh: u64, offset: u64, data: &[u8], flags: u32, reply: ReplyWrite) {
         // TODO: check if in read-only mode: EROFS
         println!("write(ino={}, fh={}, offset={}, len={}, flags=0x{:x})", ino, fh, offset, data.len(), flags);
@@ -489,12 +551,6 @@ impl Filesystem for AlgoFs {
                 reply.error(EIO);
             }
         }
-    }
-
-    /// Remove a file
-    fn unlink (&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEmpty) {
-        println!("unlink(parent={}, name=\"{}\")", parent, name.to_string_lossy());
-        reply.error(ENOSYS);
     }
 
     fn setattr (&mut self, _req: &Request, ino: u64, _mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, _atime: Option<Timespec>, _mtime: Option<Timespec>, _fh: Option<u64>, _crtime: Option<Timespec>, _chgtime: Option<Timespec>, _bkuptime: Option<Timespec>, flags:               Option<u32>, reply: ReplyAttr) {

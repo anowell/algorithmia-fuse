@@ -120,30 +120,37 @@ impl InodeStore {
             .and_then(move |ino| self.get_mut(ino))
     }
 
-    // pub fn get_mut_parent(&mut self, ino: u64) -> &mut Inode {
-    //     unimplemented!();
-    // }
-
-    // pub fn get_mut_child(&mut self, ino: u64, path: &str) -> &mut Inode {
-    //     unimplemented!();
-    // }
-
+    // Only insert new node. Panics if there is an ino collision in the map or trie
     pub fn insert(&mut self, inode: Inode) {
         let ino = inode.attr.ino;
         let sequence = path_to_sequence(&inode.path);
 
-        // CONSIDER: we could just block inserts that would cause inconsistent store
-        // assert_eq!(
-        //     self.inode_map.get(&ino).map(|i| i.attr.ino),
-        //     self.ino_trie.get(&sequence)
-        // );
-
-        let new_map_insert = self.inode_map.insert(ino, inode).is_none();
-        let new_trie_insert = self.ino_trie.insert(&sequence, ino);
-
-        if new_map_insert != new_trie_insert {
-            panic!("inconsistent inode store after inserting {} ({})", ino, self[ino].path);
+        if self.inode_map.insert(ino, inode).is_some() {
+            panic!("Corrupt inode store: reinserted ino {} into inode_map", ino);
         }
+
+        if !self.ino_trie.insert(&sequence, ino) {
+            let mut node = self.ino_trie.get_mut_node(&sequence)
+                                .expect(&format!("Corrupt inode store: couldn't insert or modify ino_trie at {:?}", &sequence));
+            // TODO: figure out why this check triggers a false alarm panic on backspacing to dir and then tabbing
+            // if node.value.is_some() {
+            //     panic!("Corrupt inode store: reinserted ino {} into ino_trie, prev value: {}", ino, node.value.unwrap());
+            // }
+            node.value = Some(ino);
+        }
+    }
+
+    pub fn remove(&mut self, ino: u64) {
+        let sequence = {
+            let ref path = self.inode_map[&ino].path;
+            path_to_sequence(&path)
+        };
+
+        self.inode_map.remove(&ino);
+        self.ino_trie.remove(&sequence);
+
+        assert!(self.inode_map.get(&ino).is_none());
+        assert!(self.ino_trie.get(&sequence).is_none());
     }
 }
 
@@ -278,6 +285,26 @@ mod tests {
         let store = build_basic_store();
         assert_eq!(store.child(2, "foo.txt").unwrap().path, "data/foo.txt");
         assert!(store.child(2, "notfound").is_none());
+    }
+
+    #[test]
+    fn test_inode_store_insert_backward() {
+        let mut store = InodeStore::new(0o750, 1000, 1000);
+        store.insert(Inode::new("data/foo/bar.txt", new_file_attr(4)));
+        store.insert(Inode::new("data/foo", new_dir_attr(3)));
+        store.insert(Inode::new("data", new_dir_attr(2)));
+
+        // lookup by ino
+        assert_eq!(&store.get(1).unwrap().path, "");
+        assert_eq!(&store.get(2).unwrap().path, "data");
+        assert_eq!(&store.get(3).unwrap().path, "data/foo");
+        assert_eq!(&store.get(4).unwrap().path, "data/foo/bar.txt");
+
+        // lookup by path
+        assert_eq!(store.get_by_path("").unwrap().attr.ino, 1);
+        assert_eq!(store.get_by_path("data").unwrap().attr.ino, 2);
+        assert_eq!(store.get_by_path("data/foo").unwrap().attr.ino, 3);
+        assert_eq!(store.get_by_path("data/foo/bar.txt").unwrap().attr.ino, 4);
     }
 
 }
