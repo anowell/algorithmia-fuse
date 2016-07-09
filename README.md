@@ -17,7 +17,7 @@ In it's current state, it works as a basic read-write filesystem with several ca
 
 - Connector support is too limited to be useful, and better support is blocked by the API - see [Issue #1](../../issues/1))
 - Writes persist when closing the last open handle to a file. If the close fails, it's likely the data isn't persisted.
-- Directory listing is permanently cached, so if you change a directory's contents outside of AlgoFS, you have to unmount and remount AlgoFS before those changes appear.
+- Directory listing is permanently cached, so if you change a directory's contents outside of AlgoFS, you have to unmount and remount AlgoFS before those changes appear. [Issue #4](../../issues/4)
 - The entire inode and file cache lives in RAM, so if you download a 4GB file, it will occupy 4GB of RAM until it is closed.
 - Testing so far is very limited.
 - General network filesystem caveats apply, e.g. some file operations may appear slow
