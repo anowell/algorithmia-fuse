@@ -10,13 +10,14 @@ mod cache;
 use algorithmia::*;
 use algorithmia::data::*;
 use fuse::*;
-use libc::{ENOENT, EIO, EROFS, ENOSYS};
+use libc::{ENOENT, EIO, EACCES, ENOSYS};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 use time::Timespec;
 use inode::{Inode, InodeStore};
 use cache::CacheEntry;
+use std::ffi::OsStr;
 
 // 2015-03-12 00:00 PST Algorithmia Launch
 pub const DEFAULT_TIME: Timespec = Timespec { sec: 1426147200, nsec: 0 };
@@ -78,7 +79,8 @@ impl AlgoFs {
             uid: options.uid,
             gid: options.gid,
         };
-        fuse::mount(adfs, &options.path, &[]);
+        let opts = [OsStr::new("ro")];
+        fuse::mount(adfs, &options.path, &opts);
     }
 
     fn cache_listdir<'a>(&'a self, ino: u64, offset: u64, mut reply: ReplyDirectory) {
@@ -199,6 +201,7 @@ impl AlgoFs {
         };
 
         if flushed {
+            // TODO: update attr mtime
             self.cache.get_mut(&ino).unwrap().sync = true;
         }
 
@@ -373,13 +376,38 @@ impl Filesystem for AlgoFs {
         }
     }
 
+    fn mknod(&mut self, _req: &Request, parent: u64, name: &Path, _mode: u32, _rdev: u32, reply: ReplyEntry) {
+        let name = name.to_string_lossy();
+        println!("mknod(parent={}, name={}, mode=0o{:o})", parent, name, _mode);
+
+        if parent <= 2 {
+            println!("User tried creating a file in fs root, or in the 'data' - both explicitly unsupported.");
+            return reply.error(EACCES);
+        }
+
+        let path = format!("{}/{}", self.inodes[parent].path, name);
+        let mtime = time::now_utc().to_timespec();
+
+        // Cloned cuz I'm tired of fighting the borrow checker tonight
+        let attr = self.insert_file(&path, mtime, 0).attr.clone();
+
+        // Need to add an entry and declare it warm, so that empty files can be created
+        //   but don't increment opened handles until `open` is called
+        let mut entry = self.cache.entry(attr.ino).or_insert_with(|| CacheEntry::new());
+        entry.warm = true;
+
+        // TODO: figure out when/if I should be using a generation number:
+        //       https://github.com/libfuse/libfuse/blob/842b59b996e3db5f92011c269649ca29f144d35e/include/fuse_lowlevel.h#L78-L91
+        reply.entry(&DEFAULT_TTL, &attr, 0);
+    }
+
     fn open (&mut self, _req: &Request, ino: u64, flags: u32, reply: ReplyOpen) {
         println!("open(ino={}, flags=0x{:x})", ino, flags);
         // match flags & O_ACCMODE => O_RDONLY, O_WRONLY, O_RDWR
 
         let mut entry = self.cache.entry(ino).or_insert_with(|| CacheEntry::new());
         entry.opened();
-        reply.opened(0, 0);
+        reply.opened(0, flags);
     }
 
     fn release (&mut self, _req: &Request, ino: u64, fh: u64, flags: u32, _lock_owner: u64, flush: bool, reply: ReplyEmpty) {
