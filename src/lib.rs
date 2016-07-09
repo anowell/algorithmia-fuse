@@ -190,6 +190,15 @@ impl AlgoFs {
         }
     }
 
+    fn algo_mkdir(&self, path: &str) -> Result<(), String> {
+        let uri = path_to_uri(&path);
+        println!("algo_mkdir: {}", uri);
+        match self.client.dir(&uri).create(DataAcl::default()) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
 
     fn flush_cache_if_needed(&mut self, ino: u64) -> Result<bool, String> {
         let flushed = {
@@ -391,7 +400,7 @@ impl Filesystem for AlgoFs {
         println!("mknod(parent={}, name={}, mode=0o{:o})", parent, name, _mode);
 
         if parent <= 2 {
-            println!("User tried creating a file in fs root, or in the 'data' - both explicitly unsupported.");
+            println!("User tried creating a file in fs root, or in 'data' - both explicitly unsupported.");
             return reply.error(EACCES);
         }
 
@@ -409,6 +418,32 @@ impl Filesystem for AlgoFs {
         // TODO: figure out when/if I should be using a generation number:
         //       https://github.com/libfuse/libfuse/blob/842b59b996e3db5f92011c269649ca29f144d35e/include/fuse_lowlevel.h#L78-L91
         reply.entry(&DEFAULT_TTL, &attr, 0);
+    }
+
+    fn mkdir(&mut self, _req: &Request, parent: u64, name: &Path, _mode: u32, reply: ReplyEntry) {
+        let name = name.to_string_lossy();
+        println!("mkdir(parent={}, name={}, mode=0o{:o})", parent, name, _mode);
+
+        if parent < 2 {
+            println!("User tried creating a dir in fs root - explicitly unsupported.");
+            return reply.error(EACCES);
+        }
+
+        let path = format!("{}/{}", self.inodes[parent].path, name);
+        match self.algo_mkdir(&path) {
+            Ok(_) => {
+                let mtime = time::now_utc().to_timespec();
+                let ref attr = self.insert_dir(&path, mtime, 0o750).attr;
+
+                // TODO: figure out when/if I should be using a generation number:
+                //       https://github.com/libfuse/libfuse/blob/842b59b996e3db5f92011c269649ca29f144d35e/include/fuse_lowlevel.h#L78-L91
+                reply.entry(&DEFAULT_TTL, attr, 0);
+            }
+            Err(err) => {
+                println!("mkdir error - {}", err);
+                reply.error(EIO);
+            }
+        }
     }
 
     fn open (&mut self, _req: &Request, ino: u64, flags: u32, reply: ReplyOpen) {

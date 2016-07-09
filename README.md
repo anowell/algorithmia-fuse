@@ -14,10 +14,10 @@ Screenshots demonstrate basic traversal and read operations from CLI and file ex
   - [x] Basic filesystem traversal
   - [x] Connector support (very limited, blocked by API - see [Issue #1](../../issues/1))
   - [x] Basic file reading (read cache caveats: see [Issue #2](../../isues/2))
-- [ ] Writeable Filesystem
+- [x] Writeable Filesystem
   - [x] Writing files (saves to API on file close, or explicit `fsync`, [upstream discussion](https://github.com/zargony/rust-fuse/issues/67) to explore deferred commits)
   - [x] Deleting files and dirs
-  - [ ] Making directories (i.e. impl `mkdir`)
+  - [x] Making directories
 - [ ] Production Filesystem
   - [ ] All the hard problems like sane caching, multi-process data races, large files, large directories, inode limits, optimizing, better timestamp consistency
 
