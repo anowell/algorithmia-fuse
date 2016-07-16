@@ -1,661 +1,240 @@
 extern crate algorithmia;
-extern crate fuse;
+extern crate netfuse;
 extern crate libc;
 extern crate time;
-extern crate sequence_trie;
-
-mod inode;
-mod cache;
+extern crate fuse;
 
 use algorithmia::*;
 use algorithmia::data::*;
-use fuse::*;
-use libc::{ENOENT, EIO, EACCES, ENOSYS};
-use std::collections::HashMap;
+use netfuse::{Metadata, NetworkFilesystem, LibcError, DirEntry};
+use fuse::FileType;
+use libc::{EIO, ENOENT, EPERM};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use time::Timespec;
-use inode::{Inode, InodeStore};
-use cache::CacheEntry;
-use std::ffi::OsStr;
+
+pub use netfuse::MountOptions;
 
 // 2015-03-12 00:00 PST Algorithmia Launch
 pub const DEFAULT_TIME: Timespec = Timespec { sec: 1426147200, nsec: 0 };
-pub const DEFAULT_TTL: Timespec = Timespec { sec: 1, nsec: 0 };
 
-pub struct MountOptions<'a> {
-    path: &'a Path,
-    uid: u32,
-    gid: u32,
-    // read_only: bool,
-}
-
-impl <'a> MountOptions<'a> {
-    pub fn new<P: AsRef<Path>>(path: &P) -> MountOptions {
-        MountOptions {
-            path: path.as_ref(),
-            uid: unsafe { libc::getuid() } as u32,
-            gid: unsafe { libc::getgid() } as u32,
-            // read_only: false,
-        }
-    }
+macro_rules! eio {
+    ($fmt:expr) => {{
+        println!($fmt);
+        Err(EIO)
+    }};
+    ($fmt:expr, $($arg:tt)*) => {{
+        println!($fmt, $($arg)*);
+        Err(EIO)
+    }};
 }
 
 pub struct AlgoFs {
-    inodes: InodeStore,
-    /// map of inodes to to data buffers - indexed by inode (NOT inode-1)
-    cache: HashMap<u64, CacheEntry>,
     client: Algorithmia,
-    uid: u32,
-    gid: u32,
 }
 
 impl AlgoFs {
     pub fn mount(options: MountOptions, client: Algorithmia) {
-        let data_root = FileAttr {
-            ino: 2,
-            size: 0,
-            blocks: 0,
-            atime: DEFAULT_TIME,
-            mtime: DEFAULT_TIME,
-            ctime: DEFAULT_TIME,
-            crtime: DEFAULT_TIME,
-            kind: FileType::Directory,
-            perm: 0o550,
-            nlink: 2,
-            uid: options.uid,
-            gid: options.gid,
-            rdev: 0,
-            flags: 0,
-        };
-
-        let mut inodes = InodeStore::new(0o550, options.uid, options.gid);
-        inodes.insert(Inode::new("data", data_root));
-
-        let adfs = AlgoFs {
-            client: client,
-            inodes: inodes,
-            cache: HashMap::new(),
-            uid: options.uid,
-            gid: options.gid,
-        };
-        let opts = [OsStr::new("ro")];
-        fuse::mount(adfs, &options.path, &opts);
+        let adfs = AlgoFs { client: client };
+        netfuse::mount(adfs, options);
     }
+}
 
-    fn cache_listdir<'a>(&'a self, ino: u64, offset: u64, mut reply: ReplyDirectory) {
-        for (i, child) in self.inodes.children(ino).iter().enumerate().skip(offset as usize) {
-            reply.add(child.attr.ino,
-                i as u64 + offset + 2,
-                child.attr.kind,
-                get_basename(&child.path));
-        }
-        reply.ok();
-    }
-
-    // TODO: support a page/offset type of arg?
-    fn algo_listdir<'a>(&'a mut self, ino: u64, offset: u64, mut reply: ReplyDirectory) {
-        // TODO: support offset
-        if offset > 0 {
-            return reply.ok();
-        }
-
-        let uri = {
-            let inode = self.inodes.get(ino).expect(&format!("path not found for inode {}", ino));
-            path_to_uri(&inode.path)
-        };
-
-        println!("Fetching algo dir listing for inode: {} (+{}) => {}",
-                 ino,
-                 offset,
-                 uri);
-
-        {
-            // Mark this node visited
-            let ref mut inodes = self.inodes;
-            let mut dir_inode = inodes.get_mut(ino).expect("inode missing for dir just listed");
-            dir_inode.visited = true;
-        }
-
-        for (i, entry_result) in self.client.dir(&uri).list().enumerate() {
-            let child = match entry_result {
-                Ok(DataItem::Dir(d)) => {
-                    let path = uri_to_path(&d.to_data_uri());
-                    self.insert_dir(&path, DEFAULT_TIME, 0o750)
-                }
-                Ok(DataItem::File(f)) => {
-                    let path = uri_to_path(&f.to_data_uri());
-                    let mtime = Timespec::new(f.last_modified.timestamp(), 0);
-                    self.insert_file(&path, mtime, f.size)
-                }
-                Err(err) => {
-                    println!("Error listing directory: {}", err);
-                    return reply.error(ENOENT);
-                }
+fn build_dir_entry(item: &DataItem) -> DirEntry {
+    match item {
+        &DataItem::Dir(ref d) => {
+            let meta = Metadata {
+                size: 0,
+                atime: DEFAULT_TIME,
+                mtime: DEFAULT_TIME,
+                ctime: DEFAULT_TIME,
+                crtime: DEFAULT_TIME,
+                kind: FileType::Directory,
+                // TODO: API should indicate if dir is listable or not
+                perm: 0o750,
             };
-            reply.add(child.attr.ino,
-                i as u64 + offset + 2,
-                child.attr.kind,
-                get_basename(&child.path));
+            DirEntry::new(d.basename().expect("dir has no name"), meta)
         }
-        reply.ok()
-    }
-
-    // TODO: support a page/offset type of arg?
-    fn algo_lookup(&mut self, path: &str) -> Result<&Inode, String> {
-        let uri = path_to_uri(&path);
-        println!("algo_lookup: {}", uri);
-        match self.client.data(&uri).into_type() {
-            Ok(DataItem::Dir(_)) => {
-                // TODO: API should indicate not listable
-                Ok(self.insert_dir(&path, DEFAULT_TIME, 0o750))
-            }
-            Ok(DataItem::File(f)) => {
-                Ok(self.insert_file(&path, Timespec::new(f.last_modified.timestamp(), 0), f.size))
-            }
-            Err(err) => Err(err.to_string()),
+        &DataItem::File(ref f) => {
+            let mtime = Timespec::new(f.last_modified.timestamp(), 0);
+            let meta = Metadata {
+                size: f.size,
+                atime: mtime,
+                mtime: mtime,
+                ctime: mtime,
+                crtime: mtime,
+                kind: FileType::RegularFile,
+                perm: 0o640,
+            };
+            DirEntry::new(f.basename().expect("file has no name"), meta)
         }
     }
+}
 
-    fn algo_read(&self, path: &str) -> Result<Vec<u8>, String> {
-        let uri = path_to_uri(&path);
-        println!("algo_read: {}", uri);
+fn basic_dir_entry(path: &str, perm: u16) -> DirEntry {
+    let meta = Metadata {
+        size: 0,
+        atime: DEFAULT_TIME,
+        mtime: DEFAULT_TIME,
+        ctime: DEFAULT_TIME,
+        crtime: DEFAULT_TIME,
+        kind: FileType::Directory,
+        perm: perm,
+    };
+    DirEntry::new(path, meta)
+}
+
+impl NetworkFilesystem for AlgoFs {
+    fn readdir(&mut self, path: &Path) -> Box<Iterator<Item=Result<DirEntry, LibcError>>> {
+        let uri = match path_to_uri(&path) {
+            Ok(u) => u,
+            Err(err) => {
+                // The default root listing
+                return Box::new(vec![
+                    Ok(basic_dir_entry("/data", 0o550)),
+                ].into_iter());
+            }
+        };
+
+        println!("AFS readdir:  {} -> {}", path.display(), uri);
+
+        let dir = self.client.dir(&uri);
+        let iter = dir.list()
+                    .map( move |child_res| {
+                        match child_res {
+                            Ok(data_item) => Ok(build_dir_entry(&data_item)),
+                            Err(err) => eio!("AFS readdir error: {}", err),
+                        }
+                    });
+
+        // Returning an Iteratator Trait Object is a bit inflexible.
+        // We can't return iter, because it references `dir` (which does NOT reference self)
+        //   so it's lifetime ends with this function.
+        // We could add `dir` to self, but may need to be able to track multiple dirs
+        //   and dropping them becomes quite complicated
+        //   so until the trait can return `impl Iterator<Item=Result<DirEntry, LibCError>>`
+        //   we're just gonna kill the laziness by collecting early
+        //   and to return an IntoIterator that owns all of it's data.
+        let hack = iter.collect::<Vec<_>>().into_iter();
+        Box::new(hack)
+    }
+
+    fn lookup(&mut self, path: &Path) -> Result<Metadata, LibcError> {
+        if valid_connector(&path) {
+            let uri = try!(path_to_uri(&path));
+            println!("AFS lookup: {} -> {}", path.display(), uri);
+
+            match self.client.data(&uri).into_type() {
+                Ok(data_item) => Ok(build_dir_entry(&data_item).metadata),
+                Err(err) => eio!("AFS lookup error: {}", err),
+            }
+        } else {
+            Err(ENOENT)
+        }
+
+    }
+
+    fn read(&mut self, path: &Path, mut buffer: &mut Vec<u8> ) -> Result<usize, LibcError> {
+        let uri = try!(path_to_uri(&path));
+        println!("AFS read: {} -> {}", path.display(), uri);
         match self.client.file(&uri).get() {
             Ok(mut response) => {
-                let mut buffer = Vec::new();
-                let _ = response.read_to_end(&mut buffer);
-                Ok(buffer)
+                let bytes = response.read_to_end(&mut buffer).expect("failed to read response bytes");
+                Ok(bytes as usize)
             }
-            Err(err) => Err(err.to_string()),
+            Err(err) => eio!("AFS read error: {}", err),
         }
     }
 
-    // Note: since delete dir and delete file are fundamentally the same request
-    //   we'll treat both as a file delete (no need for force flag, since FUSE has no such concept)
-    fn algo_delete(&self, path: &str) -> Result<(), String> {
-        let uri = path_to_uri(&path);
-        println!("algo_delete: {}", uri);
+    fn unlink(&mut self, path: &Path) -> Result<(), LibcError> {
+        let uri = try!(path_to_uri(&path));
+        println!("AFS unlink: {} -> {}", path.display(), uri);
         match self.client.file(&uri).delete() {
             Ok(_) => Ok(()),
-            Err(err) => Err(err.to_string()),
+            Err(err) => eio!("AFS unlink error: {}", err),
         }
     }
 
-    fn algo_write(&self, path: &str, data: &[u8]) -> Result<(), String> {
-        let uri = path_to_uri(&path);
-        println!("algo_write: {} ({} bytes)", uri, data.len());
+    fn rmdir(&mut self, path: &Path) -> Result<(), LibcError> {
+        let uri = try!(path_to_uri(&path));
+        println!("AFS rmdir: {} -> {}", path.display(), uri);
+        match self.client.dir(&uri).delete(false) {
+            Ok(_) => Ok(()),
+            Err(err) => eio!("AFS rmdir error: {}", err),
+        }
+    }
+
+    fn write(&mut self, path: &Path, data: &[u8]) -> Result<(), LibcError>{
+        let uri = try!(path_to_uri(&path));
+        println!("AFS write: {} -> {} ({} bytes)", path.display(), uri, data.len());
         match self.client.file(&uri).put(data) {
             Ok(_) => Ok(()),
-            Err(err) => Err(err.to_string()),
+            Err(err) => eio!("AFS write error: {}", err),
         }
     }
 
-    fn algo_mkdir(&self, path: &str) -> Result<(), String> {
-        let uri = path_to_uri(&path);
-        println!("algo_mkdir: {}", uri);
+    fn mkdir(&mut self, path: &Path) -> Result<(), LibcError> {
+        let uri = try!(path_to_uri(&path));
+        println!("algo_mkdir: {} -> {}", path.display(), uri);
         match self.client.dir(&uri).create(DataAcl::default()) {
             Ok(_) => Ok(()),
-            Err(err) => Err(err.to_string()),
-        }
-    }
-
-
-    fn flush_cache_if_needed(&mut self, ino: u64) -> Result<bool, String> {
-        let flushed = {
-            let entry = self.cache.get(&ino).unwrap();
-
-            match entry.warm && !entry.sync {
-                true => {
-                    let ref path = self.inodes[ino].path;
-                    match self.algo_write(&path, &entry.data) {
-                        Ok(_) => true,
-                        Err(err) => {
-                            println!("fsync error - {}", err);
-                            return Err(err);
-                        }
-                    }
-                }
-                false => false
-            }
-        };
-
-        if flushed {
-            // TODO: update attr mtime
-            self.cache.get_mut(&ino).unwrap().sync = true;
-        }
-
-        Ok(flushed)
-    }
-
-    fn insert_dir(&mut self, path: &str, mtime: Timespec, perm: u16) -> &Inode {
-        let ref mut inodes = self.inodes;
-        let ino = inodes.len() as u64 + 1;
-        println!("insert_dir: {} {}", ino, path);
-
-        let attr = FileAttr {
-            ino: ino,
-            size: 0,
-            blocks: 0,
-            atime: mtime,
-            mtime: mtime,
-            ctime: mtime,
-            crtime: mtime,
-            kind: FileType::Directory,
-            perm: perm,
-            nlink: 2,
-            uid: self.uid,
-            gid: self.gid,
-            rdev: 0,
-            flags: 0,
-        };
-        inodes.insert(Inode::new(path, attr));
-        inodes.get(ino).unwrap()
-    }
-
-    fn insert_file(&mut self, path: &str, mtime: Timespec, size: u64) -> &Inode {
-        let ref mut inodes = self.inodes;
-        let ino = inodes.len() as u64 + 1;
-        println!("insert_file: {} {}", ino, path);
-
-        let attr = FileAttr {
-            ino: ino,
-            size: size,
-            blocks: 0,
-            atime: mtime,
-            mtime: mtime,
-            ctime: mtime,
-            crtime: mtime,
-            kind: FileType::RegularFile,
-            perm: 0o640,
-            nlink: 2,
-            uid: self.uid,
-            gid: self.gid,
-            rdev: 0,
-            flags: 0,
-        };
-        inodes.insert(Inode::new(path, attr));
-        inodes.get(ino).unwrap()
-    }
-}
-
-impl Filesystem for AlgoFs {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEntry) {
-        let name = name.to_string_lossy();
-        println!("lookup(parent={}, name=\"{}\")", parent, name);
-        match (parent, name.as_ref()) {
-            (1, "") => reply.entry(&DEFAULT_TTL, &self.inodes[1].attr, 0),
-            (1, "data") => reply.entry(&DEFAULT_TTL, &self.inodes[2].attr, 0),
-            (1, connector) if !connector.starts_with("dropbox") && !connector.starts_with("s3") => {
-                // Filesystems look for a bunch of junk in the rootdir by default, so lets whitelist supported connector prefixes
-                reply.error(ENOENT);
-            }
-            _ => {
-                // Clone until MIR NLL lands
-                match self.inodes.child(parent, &name).cloned() {
-                    Some(child_inode) => reply.entry(&DEFAULT_TTL, &child_inode.attr, 0),
-                    None => {
-                        // Clone until MIR NLL lands
-                        let parent_inode = self.inodes[parent].clone();
-                        if parent_inode.visited {
-                            println!("lookup - short-circuiting cache miss");
-                            reply.error(ENOENT);
-                        } else {
-                            let child_path = format!("{}/{}", parent_inode.path, name);
-                            match self.algo_lookup(&child_path) {
-                                Ok(child_inode) => reply.entry(&DEFAULT_TTL, &child_inode.attr, 0),
-                                Err(err) => {
-                                    println!("lookup error - {}", err);
-                                    reply.error(ENOENT);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        };
-    }
-
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        match self.inodes.get(ino) {
-            Some(inode) => reply.attr(&DEFAULT_TTL, &inode.attr),
-            None => {
-                println!("getattr ENOENT: {}", ino);
-                reply.error(ENOENT);
-            }
-        };
-    }
-
-
-    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, size: u32, reply: ReplyData) {
-        println!("read(ino={}, fh={}, offset={}, size={})", ino, _fh, offset, size);
-
-        // Determine if we should hit the API
-        if !self.cache.get(&ino).unwrap().warm {
-            // Clone until MIR NLL
-            let path = self.inodes[ino].path.clone();
-            let response = self.algo_read(&path);
-            match response {
-                Ok(buffer) => {
-                    let mut entry = self.cache.get_mut(&ino).unwrap();
-                    entry.set(buffer);
-                    entry.sync = true;
-                },
-                Err(err) => {
-                    println!("read error: {}", err);
-                    reply.error(EIO);
-                    return
-                }
-            };
-        }
-
-        // Return the cached data
-        let ref buffer = self.cache.get(&ino).unwrap().data;
-        let end_offset = offset + size as u64;
-        match buffer.len() {
-            len if len as u64 > offset + size as u64 => {
-                reply.data(&buffer[(offset as usize)..(end_offset as usize)]);
-            }
-            len if len as u64 > offset => {
-                reply.data(&buffer[(offset as usize)..]);
-            }
-            len => {
-                println!("attempted read beyond buffer for ino {} len={} offset={} size={}", ino, len, offset, size);
-                reply.error(ENOENT);
-            }
-        }
-    }
-
-    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, mut reply: ReplyDirectory) {
-        if offset > 0 {
-            reply.ok();
-            return;
-        }
-
-        match (ino, offset) {
-            (1, 0) => {
-                reply.add(1, 0, FileType::Directory, ".");
-                reply.add(1, 1, FileType::Directory, "..");
-                reply.add(2, 2, FileType::Directory, "data");
-                reply.ok();
-            }
-            (1, _) => reply.ok(),
-            _ => {
-                if offset == 0 {
-                    let parent = self.inodes.parent(ino).expect("inode has no parent");
-                    reply.add(ino, 0, FileType::Directory, ".");
-                    reply.add(parent.attr.ino, 1, FileType::Directory, "..");
-                }
-
-                let dir_visited  = self.inodes.get(ino).map(|n| n.visited).unwrap_or(false);
-                match dir_visited {
-                    true => self.cache_listdir(ino, offset, reply),
-                    false => self.algo_listdir(ino, offset, reply),
-                };
-            },
-        }
-    }
-
-    fn mknod(&mut self, _req: &Request, parent: u64, name: &Path, _mode: u32, _rdev: u32, reply: ReplyEntry) {
-        let name = name.to_string_lossy();
-        println!("mknod(parent={}, name={}, mode=0o{:o})", parent, name, _mode);
-
-        if parent <= 2 {
-            println!("User tried creating a file in fs root, or in 'data' - both explicitly unsupported.");
-            return reply.error(EACCES);
-        }
-
-        let path = format!("{}/{}", self.inodes[parent].path, name);
-        let mtime = time::now_utc().to_timespec();
-
-        // Cloned cuz I'm tired of fighting the borrow checker tonight
-        let attr = self.insert_file(&path, mtime, 0).attr.clone();
-
-        // Need to add an entry and declare it warm, so that empty files can be created
-        //   but don't increment opened handles until `open` is called
-        let mut entry = self.cache.entry(attr.ino).or_insert_with(|| CacheEntry::new());
-        entry.warm = true;
-
-        // TODO: figure out when/if I should be using a generation number:
-        //       https://github.com/libfuse/libfuse/blob/842b59b996e3db5f92011c269649ca29f144d35e/include/fuse_lowlevel.h#L78-L91
-        reply.entry(&DEFAULT_TTL, &attr, 0);
-    }
-
-    fn mkdir(&mut self, _req: &Request, parent: u64, name: &Path, _mode: u32, reply: ReplyEntry) {
-        let name = name.to_string_lossy();
-        println!("mkdir(parent={}, name={}, mode=0o{:o})", parent, name, _mode);
-
-        if parent < 2 {
-            println!("User tried creating a dir in fs root - explicitly unsupported.");
-            return reply.error(EACCES);
-        }
-
-        let path = format!("{}/{}", self.inodes[parent].path, name);
-        match self.algo_mkdir(&path) {
-            Ok(_) => {
-                let mtime = time::now_utc().to_timespec();
-                let ref attr = self.insert_dir(&path, mtime, 0o750).attr;
-
-                // TODO: figure out when/if I should be using a generation number:
-                //       https://github.com/libfuse/libfuse/blob/842b59b996e3db5f92011c269649ca29f144d35e/include/fuse_lowlevel.h#L78-L91
-                reply.entry(&DEFAULT_TTL, attr, 0);
-            }
-            Err(err) => {
-                println!("mkdir error - {}", err);
-                reply.error(EIO);
-            }
-        }
-    }
-
-    fn open (&mut self, _req: &Request, ino: u64, flags: u32, reply: ReplyOpen) {
-        println!("open(ino={}, flags=0x{:x})", ino, flags);
-        // match flags & O_ACCMODE => O_RDONLY, O_WRONLY, O_RDWR
-
-        let mut entry = self.cache.entry(ino).or_insert_with(|| CacheEntry::new());
-        entry.opened();
-        reply.opened(0, flags);
-    }
-
-    fn release (&mut self, _req: &Request, ino: u64, fh: u64, flags: u32, _lock_owner: u64, flush: bool, reply: ReplyEmpty) {
-        println!("release(ino={}, fh={}, flags=0x{:x}, flush={})", ino, fh, flags, flush);
-
-        let handles = self.cache.get_mut(&ino).unwrap().released();
-
-        // Until I really get fsync stuff working, also write-on-close
-        if handles == 0 {
-            if let Err(err) = self.flush_cache_if_needed(ino) {
-                println!("release flush error - {}", err);
-            }
-        }
-
-        let &CacheEntry {sync, warm, ..} = self.cache.get(&ino).unwrap();
-        if handles == 0 && (sync || !warm) {
-            println!("release is purging {} from cache", ino);
-            let _ = self.cache.remove(&ino);
-        }
-
-        reply.ok();
-    }
-
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEmpty) {
-        let name = name.to_string_lossy();
-        println!("unlink(parent={}, name={})", parent, name);
-
-        if parent == 1 {
-            println!("User tried deleting a file in fs root - explicitly unsupported.");
-            return reply.error(EACCES);
-        }
-
-        let ino_opt = self.inodes.child(parent, &name).map(|inode| inode.attr.ino);
-        let path = format!("{}/{}", self.inodes[parent].path, name);
-        match self.algo_delete(&path) {
-            Ok(_) => {
-                ino_opt.map(|ino| {
-                    self.inodes.remove(ino);
-                    self.cache.remove(&ino);
-                });
-                reply.ok()
-            },
-            Err(err) => {
-                println!("Delete failed: {}", err);
-                reply.error(EIO);
-            }
-        }
-    }
-
-    fn rmdir(&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEmpty) {
-        let name = name.to_string_lossy();
-        println!("rmdir(parent={}, name={})", parent, name);
-
-        if parent == 1 {
-            println!("User tried deleting a dir in fs root - explicitly unsupported.");
-            return reply.error(EACCES);
-        }
-
-        let ino_opt = self.inodes.child(parent, &name).map(|inode| inode.attr.ino);
-        let path = format!("{}/{}", self.inodes[parent].path, name);
-        match self.algo_delete(&path) {
-            Ok(_) => {
-                ino_opt.map(|ino| {
-                    self.inodes.remove(ino);
-                    self.cache.remove(&ino);
-                });
-                reply.ok()
-            },
-            Err(err) => {
-                println!("Delete failed: {}", err);
-                reply.error(EIO);
-            }
-        }
-    }
-
-    fn write (&mut self, _req: &Request, ino: u64, fh: u64, offset: u64, data: &[u8], flags: u32, reply: ReplyWrite) {
-        // TODO: check if in read-only mode: EROFS
-        println!("write(ino={}, fh={}, offset={}, len={}, flags=0x{:x})", ino, fh, offset, data.len(), flags);
-
-
-        let is_replace = (offset == 0) && (self.inodes.get(ino).unwrap().attr.size < data.len() as u64);
-
-        // Skip data lookup if write entirely replaces file or if we already cached the API response.
-        if !is_replace && !self.cache.get(&ino).unwrap().warm {
-            // Clone until MIR NLL
-            let path = self.inodes[ino].path.clone();
-
-            // TODO: check if file exists
-            let response = self.algo_read(&path);
-            match response {
-                Ok(buffer) => {
-                    let mut entry = self.cache.get_mut(&ino).unwrap();
-                    entry.set(buffer);
-                    entry.sync = true;
-                },
-                Err(err) => {
-                    println!("read error: {}", err);
-                    reply.error(EIO);
-                    return
-                }
-            };
-        }
-
-        let new_size = match self.cache.get_mut(&ino) {
-            Some(ref mut entry) => {
-                let end = data.len() + offset as usize;
-                if end > self.inodes[ino].attr.size as usize {
-                    entry.data.resize(end, 0);
-                }
-                entry.write(offset, &data);
-                reply.written(data.len() as u32);
-                entry.data.len() as u64
-            }
-            None => {
-                println!("write failed to read file");
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        let ref mut inode = self.inodes[ino];
-        inode.attr.size = new_size;
-    }
-
-    fn fsync (&mut self, _req: &Request, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
-        println!("fsync(ino={}, fh={}, datasync={})", ino, fh, datasync);
-
-        match self.flush_cache_if_needed(ino) {
-            Ok(_) => reply.ok(),
-            Err(err) => {
-                println!("fsync error - {}", err);
-                reply.error(EIO);
-            }
-        }
-    }
-
-    fn setattr (&mut self, _req: &Request, ino: u64, _mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, _atime: Option<Timespec>, _mtime: Option<Timespec>, _fh: Option<u64>, _crtime: Option<Timespec>, _chgtime: Option<Timespec>, _bkuptime: Option<Timespec>, flags:               Option<u32>, reply: ReplyAttr) {
-        println!("setattr(ino={}, mode={:?}, size={:?}, fh={:?}, flags={:?})", ino, _mode, size, _fh, flags);
-        match self.inodes.get_mut(ino) {
-            Some(mut inode) => {
-                if let Some(new_size) = size {
-                    inode.attr.size = new_size;
-                }
-                if let Some(new_uid) = uid {
-                    inode.attr.uid = new_uid;
-                }
-                if let Some(new_gid) = gid {
-                    inode.attr.gid = new_gid;
-                }
-                // TODO: is mode (u32) equivalent to attr.perm (u16)?
-                reply.attr(&DEFAULT_TTL, &inode.attr);
-            }
-            None => reply.error(ENOENT)
+            Err(err) => eio!("AFS mkdir error: {}", err),
         }
     }
 }
 
-pub fn path_to_uri(path: &str) -> String {
-    let parts: Vec<_> = match path.starts_with("/") {
-        true => &path[1..],
-        false => &path,
-    }.splitn(2, "/").collect();
+pub fn valid_connector(path: &Path) -> bool {
+    let mut iter = path.components();
+    if path.has_root() {
+        let _ = iter.next();
+    }
 
-    match parts.len() {
-        1 => format!("{}://", parts[0]),
-        2 => parts.join("://"),
-        _ => unreachable!(),
+    match iter.next().map(|c| c.as_os_str().to_string_lossy() ) {
+        Some(p) => {
+            p == "data"
+                || p.starts_with("dropbox")
+                || p.starts_with("s3")
+        }
+        _ => false,
     }
 }
 
-pub fn uri_to_path(uri: &str) -> String {
-    let parts: Vec<_> = uri.splitn(2, "://").collect();
-    match parts.len() {
-        1 if parts[0].is_empty() => "data".to_string(),
-        1 => format!("data/{}", parts[0]),
-        2 if parts[1].is_empty() => parts[0].to_string(),
-        2 => parts.join("/"),
-        _ => unreachable!(),
+pub fn path_to_uri(path: &Path) -> Result<String, LibcError> {
+    let mut iter = path.components();
+    if path.has_root() {
+        let _ = iter.next();
     }
+
+    let protocol = match iter.next() {
+        Some(p) => p.as_os_str(),
+        None => { return Err(EPERM); },
+    };
+    let uri_path = iter.as_path();
+    Ok(format!("{}://{}", protocol.to_string_lossy(), uri_path.to_string_lossy()))
 }
 
-
-fn get_basename(path: &str) -> String {
-    path.rsplitn(2, "/").next().unwrap().to_string()
+pub fn uri_to_path(uri: &str) -> PathBuf {
+    uri.splitn(2, "://")
+        .fold(Path::new("/").to_owned(), |acc, p| acc.join(Path::new(p)) )
 }
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use std::path::Path;
     #[test]
     fn test_path_to_uri() {
-        assert_eq!(&*path_to_uri("data"), "data://");
-        assert_eq!(&*path_to_uri("data/foo"), "data://foo");
-        assert_eq!(&*path_to_uri("data/foo/bar.txt"), "data://foo/bar.txt");
+        assert_eq!(&*path_to_uri(Path::new("/data")), "data://");
+        assert_eq!(&*path_to_uri(Path::new("/data/foo")), "data://foo");
+        assert_eq!(&*path_to_uri(Path::new("/data/foo/bar.txt")), "data://foo/bar.txt");
     }
 
     #[test]
     fn test_uri_to_path() {
-        assert_eq!(&*uri_to_path("data://"), "data");
-        assert_eq!(&*uri_to_path("data://foo"), "data/foo");
-        assert_eq!(&*uri_to_path("data://foo/bar.txt"), "data/foo/bar.txt");
+        assert_eq!(&*uri_to_path("data://"), Path::new("/data"));
+        assert_eq!(&*uri_to_path("data://foo"), Path::new("/data/foo"));
+        assert_eq!(&*uri_to_path("data://foo/bar.txt"), Path::new("/data/foo/bar.txt"));
     }
 
 }
