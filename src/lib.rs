@@ -88,7 +88,7 @@ impl NetworkFilesystem for AlgoFs {
     fn readdir(&mut self, path: &Path) -> Box<Iterator<Item=Result<DirEntry, LibcError>>> {
         let uri = match path_to_uri(&path) {
             Ok(u) => u,
-            Err(err) => {
+            Err(_) => {
                 // The default root listing
                 return Box::new(vec![
                     Ok(basic_dir_entry("/data", 0o550)),
@@ -126,6 +126,7 @@ impl NetworkFilesystem for AlgoFs {
 
             match self.client.data(&uri).into_type() {
                 Ok(data_item) => Ok(build_dir_entry(&data_item).metadata),
+                Err(algorithmia::Error::NotFound(_)) => Err(ENOENT),
                 Err(err) => eio!("AFS lookup error: {}", err),
             }
         } else {
