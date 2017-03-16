@@ -8,9 +8,7 @@ A user-mode virtual filesystem backed by the Algorithmia API. Basically, it hand
 ## Screenshots
 Screenshots demonstrate basic traversal and read operations from CLI and file explorer:
 
-![Screenshot](https://dl.dropboxusercontent.com/u/39033486/Algorithmia/algofs-walk-and-grep.png)
-
-![Screenshot](https://dl.dropboxusercontent.com/u/39033486/Algorithmia/algofs-reading-files.png)
+![Screenshot](https://www.dropbox.com/s/cczorhr7zmlbn78/algofs-walk-and-grep.png?dl=0)
 
 ## Status
 
